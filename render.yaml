@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: bolosplit-backend
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_GENAI_USE_VERTEXAI
+        value: "false"
+      - key: FIREBASE_PROJECT_ID
+        value: bolosplit-274e0
+      - key: FIREBASE_CREDENTIALS_JSON
+        sync: false
