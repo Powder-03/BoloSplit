@@ -18,7 +18,15 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GOOGLE_GENAI_USE_VERTEXAI
-        value: "false"
+        value: "true"
+      - key: GOOGLE_CLOUD_PROJECT
+        value: project-1b52589d-0827-46ab-9be
+      - key: GOOGLE_CLOUD_LOCATION
+        value: global
+      - key: STAGE1_MODEL
+        value: gemini-3.8-flash
+      - key: STAGE2_MODEL
+        value: gemini-4-hydrogen
       - key: FIREBASE_PROJECT_ID
         value: bolosplit-274e0
       - key: FIREBASE_CREDENTIALS_JSON

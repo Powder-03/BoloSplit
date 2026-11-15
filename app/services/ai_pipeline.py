@@ -37,12 +37,16 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 def get_genai_client() -> genai.Client:
     """Instantiate official google-genai client with Vertex AI or API key."""
     if settings.GOOGLE_GENAI_USE_VERTEXAI:
-        return genai.Client(
-            vertexai=True,
-            project=settings.GOOGLE_CLOUD_PROJECT,
-            location=settings.GOOGLE_CLOUD_LOCATION,
-            http_options=types.HttpOptions(timeout=60000),
-        )
+        client_kwargs: dict[str, Any] = {
+            "vertexai": True,
+            "project": settings.GOOGLE_CLOUD_PROJECT,
+            "location": settings.GOOGLE_CLOUD_LOCATION,
+            "http_options": types.HttpOptions(timeout=60000),
+        }
+        if settings.GEMINI_API_KEY:
+            client_kwargs["api_key"] = settings.GEMINI_API_KEY
+        return genai.Client(**client_kwargs)
+
     return genai.Client(
         api_key=settings.GEMINI_API_KEY,
         http_options=types.HttpOptions(timeout=60000),
