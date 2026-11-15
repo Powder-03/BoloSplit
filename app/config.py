@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # Firebase Auth Configuration
     FIREBASE_CREDENTIALS_PATH: str | None = None
     FIREBASE_CREDENTIALS_JSON: str | None = None
+    FIREBASE_CREDENTIALS_BASE64: str | None = None
     FIREBASE_PROJECT_ID: str | None = None
 
 

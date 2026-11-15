@@ -37,14 +37,36 @@ def init_firebase() -> bool:
         except Exception as e:
             logging.getLogger(__name__).warning("Failed to initialize Firebase from FIREBASE_CREDENTIALS_JSON: %s", e)
 
-    # 2. Check custom path from settings
+    # 2. Check base64 encoded JSON string from environment variable
+    if settings.FIREBASE_CREDENTIALS_BASE64:
+        try:
+            import base64
+
+            decoded = base64.b64decode(settings.FIREBASE_CREDENTIALS_BASE64).decode("utf-8")
+            cert_dict = json.loads(decoded)
+            cred = credentials.Certificate(cert_dict)
+            firebase_admin.initialize_app(cred)
+            _firebase_initialized = True
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).warning("Failed to initialize Firebase from FIREBASE_CREDENTIALS_BASE64: %s", e)
+
+    # 3. Check Render Secret File mount location (/etc/secrets/firebase-service-account.json)
+    render_secret = Path("/etc/secrets/firebase-service-account.json")
+    if render_secret.exists():
+        cred = credentials.Certificate(str(render_secret))
+        firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        return True
+
+    # 4. Check custom path from settings
     if settings.FIREBASE_CREDENTIALS_PATH and os.path.exists(settings.FIREBASE_CREDENTIALS_PATH):
         cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
         firebase_admin.initialize_app(cred)
         _firebase_initialized = True
         return True
 
-    # 3. Check default service account location in workspace
+    # 5. Check default service account location in workspace
     default_json = Path("./firebase-service-account.json")
     if default_json.exists():
         cred = credentials.Certificate(str(default_json))
@@ -52,7 +74,7 @@ def init_firebase() -> bool:
         _firebase_initialized = True
         return True
 
-    # 4. Check project ID options (e.g. Google Application Default Credentials)
+    # 6. Check project ID options (e.g. Google Application Default Credentials)
     if settings.FIREBASE_PROJECT_ID:
         firebase_admin.initialize_app(options={"projectId": settings.FIREBASE_PROJECT_ID})
         _firebase_initialized = True
