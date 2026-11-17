@@ -19,6 +19,9 @@ from app.schemas.ledger import (
     FriendRead,
     GroupCreate,
     GroupRead,
+    SelfCategoryStat,
+    SelfExpenseCreate,
+    SelfExpensesSummary,
     UserBalance,
 )
 from app.schemas.staging import (
@@ -53,4 +56,7 @@ __all__ = [
     "FriendRead",
     "BalanceSummary",
     "UserBalance",
+    "SelfExpenseCreate",
+    "SelfCategoryStat",
+    "SelfExpensesSummary",
 ]

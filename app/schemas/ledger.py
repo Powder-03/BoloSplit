@@ -72,6 +72,41 @@ class ExpenseRead(BaseModel):
     splits: list[ExpenseSplitRead] = Field(default_factory=list)
 
 
+class SelfExpenseCreate(BaseModel):
+    """Payload to create a strictly solo / self expense directly."""
+
+    description: str = Field(..., max_length=255, description="Expense description (e.g. 'Petrol', 'Coffee').")
+    amount: Decimal = Field(..., gt=Decimal("0.00"), description="Exact expense amount in Decimal.")
+    currency: str = Field(default="INR", max_length=10)
+    category: str | None = Field(default="general", max_length=100)
+    expense_date: datetime | None = None
+
+
+class SelfCategoryStat(BaseModel):
+    """Aggregated spending in a single category for Self tab."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    category: str
+    total_amount: Decimal
+    count: int
+
+
+class SelfExpensesSummary(BaseModel):
+    """Summary response for the Self tab."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    total_spending: Decimal = Field(default=Decimal("0.00"), description="Total solo spending.")
+    this_month_spending: Decimal = Field(
+        default=Decimal("0.00"), description="Total solo spending in current calendar month."
+    )
+    total_count: int = Field(default=0, description="Total number of solo expenses.")
+    currency: str = Field(default="INR", max_length=10)
+    categories: list[SelfCategoryStat] = Field(default_factory=list)
+    expenses: list[ExpenseRead] = Field(default_factory=list)
+
+
 class GroupCreate(BaseModel):
     """Payload to create a new group."""
 

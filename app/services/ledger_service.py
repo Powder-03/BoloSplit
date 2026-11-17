@@ -2,16 +2,23 @@
 
 import uuid
 from collections import defaultdict
+from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.expense import Expense
+from app.models.expense import Expense, ExpenseSplit
 from app.models.settlement import Settlement
 from app.models.user import User
-from app.schemas.ledger import BalanceSummary, UserBalance
+from app.schemas.ledger import (
+    BalanceSummary,
+    ExpenseRead,
+    SelfCategoryStat,
+    SelfExpensesSummary,
+    UserBalance,
+)
 
 
 def calculate_equal_splits(
@@ -211,4 +218,144 @@ async def get_user_balances(
         total_you_owe=total_you_owe,
         net_total=total_owed_to_you - total_you_owe,
         balances=user_balances,
+    )
+
+
+def is_solo_expense(expense: Expense, user_id: uuid.UUID) -> bool:
+    """
+    Determine if an expense is strictly a solo / self expense for user_id.
+
+    Criteria:
+    1. group_id is None (not a group expense).
+    2. payer_id == user_id (paid by the user).
+    3. Splits contain no other user (only user_id or empty).
+    """
+    if expense.group_id is not None:
+        return False
+    if expense.payer_id != user_id:
+        return False
+    if not expense.splits:
+        return True
+    return all(split.user_id == user_id for split in expense.splits)
+
+
+async def get_self_expenses_summary(
+    session: AsyncSession,
+    user: User,
+    limit: int = 50,
+    offset: int = 0,
+    category: str | None = None,
+    month: int | None = None,
+    year: int | None = None,
+) -> SelfExpensesSummary:
+    """
+    Compute strictly solo / personal spending summary and paginated expenses for user.
+
+    Excludes all group expenses and expenses with shared participant splits.
+    """
+    other_split_subquery = select(ExpenseSplit.id).where(
+        ExpenseSplit.expense_id == Expense.id,
+        ExpenseSplit.user_id != user.id,
+    )
+    base_query = (
+        select(Expense)
+        .options(selectinload(Expense.splits))
+        .where(
+            Expense.is_deleted.is_(False),
+            Expense.group_id.is_(None),
+            Expense.payer_id == user.id,
+            ~other_split_subquery.exists(),
+        )
+        .order_by(Expense.expense_date.desc())
+    )
+
+    result = await session.execute(base_query)
+    all_solo_expenses = result.scalars().all()
+
+    now = datetime.now(UTC)
+
+    # Current calendar month boundaries (UTC)
+    curr_month_start = datetime(now.year, now.month, 1, 0, 0, 0, tzinfo=UTC)
+    if now.month == 12:
+        curr_month_end = datetime(now.year + 1, 1, 1, 0, 0, 0, tzinfo=UTC)
+    else:
+        curr_month_end = datetime(now.year, now.month + 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    # Specific filter period boundaries if month or year provided
+    target_year = year or now.year
+    target_month = month or now.month
+    period_start = datetime(target_year, target_month, 1, 0, 0, 0, tzinfo=UTC)
+    if target_month == 12:
+        period_end = datetime(target_year + 1, 1, 1, 0, 0, 0, tzinfo=UTC)
+    else:
+        period_end = datetime(target_year, target_month + 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    def _ensure_utc(dt: datetime) -> datetime:
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+    # Total spending across all solo expenses
+    total_spending = sum((e.amount for e in all_solo_expenses), Decimal("0.00"))
+
+    # This month spending (current calendar month, or target month if explicitly requested)
+    this_month_spending = sum(
+        (
+            e.amount
+            for e in all_solo_expenses
+            if curr_month_start <= _ensure_utc(e.expense_date) < curr_month_end
+        ),
+        Decimal("0.00"),
+    )
+
+    # Category breakdown (for requested month/year if specified, otherwise overall)
+    breakdown_pool = all_solo_expenses
+    if month is not None or year is not None:
+        breakdown_pool = [
+            e for e in all_solo_expenses if period_start <= _ensure_utc(e.expense_date) < period_end
+        ]
+
+    cat_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0.00"))
+    cat_counts: dict[str, int] = defaultdict(int)
+    for e in breakdown_pool:
+        cat = (e.category or "general").strip().lower()
+        cat_totals[cat] += e.amount
+        cat_counts[cat] += 1
+
+    categories = [
+        SelfCategoryStat(category=cat, total_amount=amt, count=cat_counts[cat])
+        for cat, amt in cat_totals.items()
+    ]
+    categories.sort(key=lambda c: c.total_amount, reverse=True)
+
+    # Filter for paginated expense list
+    filtered_expenses = all_solo_expenses
+    if month is not None or year is not None:
+        filtered_expenses = [
+            e
+            for e in filtered_expenses
+            if period_start <= _ensure_utc(e.expense_date) < period_end
+        ]
+    if category is not None:
+        clean_cat = category.strip().lower()
+        filtered_expenses = [
+            e
+            for e in filtered_expenses
+            if (e.category or "general").strip().lower() == clean_cat
+        ]
+
+    total_count = len(filtered_expenses)
+    paginated = filtered_expenses[offset : offset + limit]
+
+    expense_reads: list[ExpenseRead] = []
+    for e in paginated:
+        read_item = ExpenseRead.model_validate(e)
+        read_item.payer_name = user.name
+        expense_reads.append(read_item)
+
+    return SelfExpensesSummary(
+        total_spending=total_spending,
+        this_month_spending=this_month_spending,
+        total_count=total_count,
+        currency="INR",
+        categories=categories,
+        expenses=expense_reads,
     )
