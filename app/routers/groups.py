@@ -20,6 +20,7 @@ from app.schemas.ledger import (
     BilateralActivityFeed,
     FriendCreate,
     FriendRead,
+    FriendUpdate,
     GroupActivityFeed,
     GroupCreate,
     GroupDetailRead,
@@ -117,10 +118,25 @@ async def get_group_details(
         .where(GroupMember.group_id == group_id)
     )
     member_records = members_res.all()
+
+    # Load caller's custom nicknames for group members
+    member_user_ids = [u.id for _, u in member_records if u.id != current_user.id]
+    nicknames_map: dict[uuid.UUID, str | None] = {}
+    if member_user_ids:
+        ships_res = await session.execute(
+            select(Friendship).where(
+                Friendship.user_id == current_user.id,
+                Friendship.friend_id.in_(member_user_ids),
+            )
+        )
+        for s in ships_res.scalars().all():
+            nicknames_map[s.friend_id] = s.nickname
+
     members_list = [
         GroupMemberRead(
             user_id=u.id,
             name=u.name,
+            nickname=nicknames_map.get(u.id),
             email=u.email,
             phone=u.phone,
             role=gm.role,
@@ -221,9 +237,9 @@ async def add_group_member(
         mem = GroupMember(group_id=group_id, user_id=target_user.id, role=payload.role)
         session.add(mem)
 
-        # Also register reciprocal friendship between caller and target_user
+        # Also register reciprocal friendship between caller and target_user (clean custom-alias slots)
         if target_user.id != current_user.id:
-            for u1, u2, nick in [(current_user, target_user, target_user.name), (target_user, current_user, current_user.name)]:
+            for u1, u2 in [(current_user, target_user), (target_user, current_user)]:
                 ship = (
                     await session.execute(
                         select(Friendship).where(
@@ -236,8 +252,8 @@ async def add_group_member(
                         Friendship(
                             user_id=u1.id,
                             friend_id=u2.id,
-                            nickname=nick,
-                            aliases=[u2.name.lower()],
+                            nickname=None,
+                            aliases=[],
                         )
                     )
 
@@ -282,12 +298,38 @@ async def join_group(
     )
     existing_mem = (await session.execute(mem_query)).scalars().first()
     if not existing_mem:
+        # Fetch existing group members before adding caller so we can create reciprocal friendships
+        existing_members_res = await session.execute(
+            select(GroupMember.user_id).where(GroupMember.group_id == group.id)
+        )
+        existing_member_ids = [uid for uid in existing_members_res.scalars().all() if uid != current_user.id]
+
         member = GroupMember(
             group_id=group.id,
             user_id=current_user.id,
             role="member",
         )
         session.add(member)
+
+        for other_uid in existing_member_ids:
+            for u1_id, u2_id in [(current_user.id, other_uid), (other_uid, current_user.id)]:
+                ship = (
+                    await session.execute(
+                        select(Friendship).where(
+                            Friendship.user_id == u1_id, Friendship.friend_id == u2_id
+                        )
+                    )
+                ).scalars().first()
+                if not ship:
+                    session.add(
+                        Friendship(
+                            user_id=u1_id,
+                            friend_id=u2_id,
+                            nickname=None,
+                            aliases=[],
+                        )
+                    )
+
         await session.commit()
 
     return GroupRead.model_validate(group)
@@ -412,6 +454,55 @@ async def get_group_activity_feed(
 # -------------------------------------------------------------
 
 
+async def _normalize_and_validate_aliases(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    target_friend_id: uuid.UUID,
+    raw_nickname: str | None,
+    raw_aliases: list[str],
+) -> tuple[str | None, list[str]]:
+    """
+    Normalize custom nickname/aliases and ensure they do not collide with any
+    other friend's custom nickname or aliases for the same user.
+    """
+    clean_nickname = raw_nickname.strip() if raw_nickname and raw_nickname.strip() else None
+
+    seen: set[str] = set()
+    clean_aliases: list[str] = []
+    for a in raw_aliases:
+        norm = a.strip().lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            clean_aliases.append(norm)
+
+    candidate_labels = set(clean_aliases)
+    if clean_nickname:
+        candidate_labels.add(clean_nickname.lower())
+
+    if candidate_labels:
+        other_ships_res = await session.execute(
+            select(Friendship).where(
+                Friendship.user_id == user_id,
+                Friendship.friend_id != target_friend_id,
+            )
+        )
+        for other in other_ships_res.scalars().all():
+            other_labels: set[str] = {
+                a.strip().lower() for a in (other.aliases or []) if a and a.strip()
+            }
+            if other.nickname and other.nickname.strip():
+                other_labels.add(other.nickname.strip().lower())
+
+            conflicts = sorted(candidate_labels & other_labels)
+            if conflicts:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Alias or nickname '{conflicts[0]}' is already assigned to another friend.",
+                )
+
+    return clean_nickname, clean_aliases
+
+
 @router.post(
     "/friends",
     response_model=FriendRead,
@@ -449,11 +540,13 @@ async def add_friend(
             detail="Either friend_email or friend_phone is required.",
         )
 
-    clean_aliases = list(set([a.strip().lower() for a in payload.aliases if a.strip()]))
-    if payload.nickname and payload.nickname.strip().lower() not in clean_aliases:
-        clean_aliases.append(payload.nickname.strip().lower())
-    if target_user.name.strip().lower() not in clean_aliases:
-        clean_aliases.append(target_user.name.strip().lower())
+    clean_nickname, clean_aliases = await _normalize_and_validate_aliases(
+        session=session,
+        user_id=current_user.id,
+        target_friend_id=target_user.id,
+        raw_nickname=payload.nickname,
+        raw_aliases=payload.aliases,
+    )
 
     # 1. Forward friendship: caller -> friend
     ship1 = (
@@ -465,18 +558,18 @@ async def add_friend(
     ).scalars().first()
 
     if ship1:
-        ship1.nickname = payload.nickname
+        ship1.nickname = clean_nickname
         ship1.aliases = clean_aliases
     else:
         ship1 = Friendship(
             user_id=current_user.id,
             friend_id=target_user.id,
-            nickname=payload.nickname,
+            nickname=clean_nickname,
             aliases=clean_aliases,
         )
         session.add(ship1)
 
-    # 2. Reciprocal friendship: friend -> caller (so friend sees caller in their friends list!)
+    # 2. Reciprocal friendship: friend -> caller (clean slot so friend sets their own alias)
     ship2 = (
         await session.execute(
             select(Friendship).where(
@@ -486,12 +579,11 @@ async def add_friend(
     ).scalars().first()
 
     if not ship2:
-        caller_aliases = [current_user.name.lower()]
         ship2 = Friendship(
             user_id=target_user.id,
             friend_id=current_user.id,
-            nickname=current_user.name,
-            aliases=caller_aliases,
+            nickname=None,
+            aliases=[],
         )
         session.add(ship2)
 
@@ -508,6 +600,73 @@ async def add_friend(
         nickname=ship1.nickname,
         aliases=ship1.aliases,
         created_at=ship1.created_at,
+    )
+
+
+@router.patch(
+    "/friends/{friend_id}",
+    response_model=FriendRead,
+    summary="Set or update custom nickname and spoken aliases for a friend",
+)
+async def update_friend_aliases(
+    friend_id: uuid.UUID,
+    payload: FriendUpdate,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> FriendRead:
+    """Update only the caller's custom nickname and spoken aliases for a specific friend."""
+    ship = (
+        await session.execute(
+            select(Friendship).where(
+                Friendship.user_id == current_user.id,
+                Friendship.friend_id == friend_id,
+            )
+        )
+    ).scalars().first()
+    if not ship:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Friend relationship not found.",
+        )
+
+    friend_user = (
+        await session.execute(select(User).where(User.id == friend_id))
+    ).scalars().first()
+    if not friend_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Friend user not found.",
+        )
+
+    next_nickname = payload.nickname if "nickname" in payload.model_fields_set else ship.nickname
+    if "aliases" in payload.model_fields_set:
+        next_aliases = payload.aliases or []
+    else:
+        next_aliases = list(ship.aliases or [])
+
+    clean_nickname, clean_aliases = await _normalize_and_validate_aliases(
+        session=session,
+        user_id=current_user.id,
+        target_friend_id=friend_id,
+        raw_nickname=next_nickname,
+        raw_aliases=next_aliases,
+    )
+
+    ship.nickname = clean_nickname
+    ship.aliases = clean_aliases
+    await session.commit()
+    await session.refresh(ship)
+
+    return FriendRead(
+        id=ship.id,
+        user_id=ship.user_id,
+        friend_id=ship.friend_id,
+        friend_name=friend_user.name,
+        friend_email=friend_user.email,
+        friend_phone=friend_user.phone,
+        nickname=ship.nickname,
+        aliases=ship.aliases,
+        created_at=ship.created_at,
     )
 
 
@@ -562,6 +721,16 @@ async def get_bilateral_activity_feed(
     friend = (await session.execute(select(User).where(User.id == friend_id))).scalars().first()
     if not friend:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Friend not found.")
+
+    ship = (
+        await session.execute(
+            select(Friendship).where(
+                Friendship.user_id == current_user.id,
+                Friendship.friend_id == friend_id,
+            )
+        )
+    ).scalars().first()
+    friend_nickname = ship.nickname if ship else None
 
     # 1. Fetch expenses where both are involved
     exp_query = (
@@ -700,6 +869,7 @@ async def get_bilateral_activity_feed(
     return BilateralActivityFeed(
         friend_id=friend.id,
         friend_name=friend.name,
+        nickname=friend_nickname,
         net_balance=net_balance,
         currency="INR",
         summary_text=summary_text,

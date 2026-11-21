@@ -130,6 +130,7 @@ class GroupMemberRead(BaseModel):
 
     user_id: uuid.UUID
     name: str
+    nickname: str | None = None
     email: str
     phone: str | None = None
     role: str = "member"
@@ -168,6 +169,13 @@ class FriendCreate(BaseModel):
     aliases: list[str] = Field(default_factory=list)
 
 
+class FriendUpdate(BaseModel):
+    """Payload to set or update a custom nickname and spoken aliases for a friend."""
+
+    nickname: str | None = Field(default=None, max_length=100)
+    aliases: list[str] | None = None
+
+
 class FriendRead(BaseModel):
     """Friendship details."""
 
@@ -187,6 +195,7 @@ class UserBalance(BaseModel):
 
     user_id: uuid.UUID
     user_name: str
+    nickname: str | None = None
     net_balance: Decimal = Field(
         ...,
         description="Positive if they owe you, negative if you owe them.",
@@ -237,6 +246,7 @@ class BilateralActivityFeed(BaseModel):
 
     friend_id: uuid.UUID
     friend_name: str
+    nickname: str | None = None
     net_balance: Decimal
     currency: str = "INR"
     summary_text: str

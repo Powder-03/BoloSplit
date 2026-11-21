@@ -1,6 +1,7 @@
 """AI Pipeline: Direct-to-Ledger Voice Execution Engine (gemini-3.8-flash -> gemini-4-hydrogen)."""
 
 import json
+import re
 import uuid
 import zoneinfo
 from datetime import UTC, datetime, timedelta
@@ -82,11 +83,9 @@ async def get_user_directory(
         for f in friendships:
             friend_user = user_map.get(f.friend_id)
             if friend_user:
-                aliases = list(f.aliases) if f.aliases else []
-                if f.nickname and f.nickname.lower() not in [a.lower() for a in aliases]:
-                    aliases.append(f.nickname)
-                if friend_user.name.lower() not in [a.lower() for a in aliases]:
-                    aliases.append(friend_user.name)
+                custom_aliases = [
+                    a.strip() for a in (f.aliases or []) if a and a.strip()
+                ]
 
                 directory.append(
                     {
@@ -94,7 +93,7 @@ async def get_user_directory(
                         "name": friend_user.name,
                         "email": friend_user.email,
                         "nickname": f.nickname,
-                        "aliases": aliases,
+                        "aliases": custom_aliases,
                         "is_caller": False,
                     }
                 )
@@ -155,13 +154,60 @@ def resolve_group_id(group_raw: str | None, user_groups: list[dict[str, Any]]) -
     return None
 
 
+def _score_member_match(raw_clean: str, member: dict[str, Any]) -> tuple[int, int] | None:
+    """
+    Score how well a spoken raw name matches a directory member.
+
+    Lower tier is higher priority; more negative length breaks ties in favor of
+    more specific matches (e.g. 'rishabh sharma' over 'rishabh').
+    """
+    custom_labels: list[str] = []
+    if member.get("nickname") and str(member["nickname"]).strip():
+        custom_labels.append(str(member["nickname"]).strip().lower())
+    for alias in member.get("aliases", []):
+        if alias and str(alias).strip():
+            custom_labels.append(str(alias).strip().lower())
+
+    real_name = str(member.get("name", "")).strip().lower()
+
+    # Tier 1: Exact custom nickname or alias match
+    if raw_clean in custom_labels:
+        return (1, -len(raw_clean))
+
+    # Tier 2: Exact User.name match
+    if real_name and raw_clean == real_name:
+        return (2, -len(raw_clean))
+
+    # Tier 3: Whole-word match against custom nickname/aliases
+    raw_word_pat = re.compile(rf"\b{re.escape(raw_clean)}\b")
+    for lbl in custom_labels:
+        if raw_word_pat.search(lbl) or re.search(rf"\b{re.escape(lbl)}\b", raw_clean):
+            return (3, -len(lbl))
+
+    # Tier 4: Whole-word match against User.name
+    if real_name and (
+        raw_word_pat.search(real_name) or re.search(rf"\b{re.escape(real_name)}\b", raw_clean)
+    ):
+        return (4, -len(real_name))
+
+    # Tier 5: Substring fallback (length >= 3 to avoid short-token collisions like 'ram' in 'vikram')
+    if len(raw_clean) >= 3:
+        for lbl in custom_labels:
+            if len(lbl) >= 3 and (raw_clean in lbl or lbl in raw_clean):
+                return (5, -len(lbl))
+        if real_name and len(real_name) >= 3 and (raw_clean in real_name or real_name in raw_clean):
+            return (5, -len(real_name))
+
+    return None
+
+
 def resolve_participant_ids(
     raw_names: list[str],
     user_directory: list[dict[str, Any]],
     caller_id: uuid.UUID,
     group_members: list[dict[str, Any]] | None = None,
 ) -> list[uuid.UUID]:
-    """Map spoken raw participant names to verified User IDs using aliases and group members."""
+    """Map spoken raw participant names to verified User IDs using ranked alias & name matching."""
     # Combine directory with group members if available
     combined_directory = list(user_directory)
     if group_members:
@@ -173,7 +219,8 @@ def resolve_participant_ids(
                         "user_id": gm["user_id"],
                         "name": gm["name"],
                         "email": gm["email"],
-                        "aliases": [gm["name"].lower()],
+                        "nickname": None,
+                        "aliases": [],
                         "is_caller": False,
                     }
                 )
@@ -188,22 +235,28 @@ def resolve_participant_ids(
             matched_ids.add(caller_id)
             continue
 
-        for member in combined_directory:
-            member_id = uuid.UUID(member["user_id"])
-            names_to_check = [member["name"].lower()]
-            if member.get("nickname"):
-                names_to_check.append(member["nickname"].lower())
-            for alias in member.get("aliases", []):
-                names_to_check.append(alias.lower())
+        best_score: tuple[int, int, int] | None = None
+        best_member_id: uuid.UUID | None = None
 
-            if any(raw_clean == n or raw_clean in n or n in raw_clean for n in names_to_check):
-                matched_ids.add(member_id)
-                break
+        for idx, member in enumerate(combined_directory):
+            if member.get("is_caller"):
+                continue
+            score = _score_member_match(raw_clean, member)
+            if score is not None:
+                ranked = (score[0], score[1], idx)
+                if best_score is None or ranked < best_score:
+                    best_score = ranked
+                    best_member_id = uuid.UUID(member["user_id"])
 
-    # If caller wasn't explicitly excluded and other participants were named, include caller
+        if best_member_id is not None:
+            matched_ids.add(best_member_id)
+
+    # Fallback to caller only if no participant matched, or caller was explicitly included
     if not matched_ids:
         matched_ids.add(caller_id)
-    elif caller_id not in matched_ids and any(r in ["me", "myself", "all", "sab"] for r in raw_names):
+    elif caller_id not in matched_ids and any(
+        r.strip().lower() in ["me", "myself", "i", "all", "sab"] for r in raw_names
+    ):
         matched_ids.add(caller_id)
 
     return list(matched_ids)

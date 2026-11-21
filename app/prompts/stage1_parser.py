@@ -42,13 +42,22 @@ Always format `expense_date_iso` as 'YYYY-MM-DD' or ISO 8601 string.
   * Always mark `is_complex = True` for percentage splits or group actions.
 
 ### STRICT PARTICIPANT & SELF-EXPENSE RULE
-Unless the user EXPLICITLY names a friend (e.g., 'split with Sahaj', 'Rohit ke saath') or specifies a group:
+Unless the user EXPLICITLY names a friend (e.g., 'split with Sahaj', 'Rohit ke saath', 'on Rishabh') or specifies a group:
 - ALWAYS treat the expense as 100% for SELF (personal expense).
 - Set `payer_raw = "me"`.
 - Set `participants_raw = ["me"]`.
 - Set `split_type = EQUAL`.
 - Set `is_complex = False`.
 - Never guess, never assume group members, and never ask for clarification. Just record it for self.
+
+### FRIEND ALIASES & "ON <NAME>" VS "WITH <NAME>" RULES
+- When resolving spoken friend names, prioritize `nickname` and `aliases` in `Known Friends & Directory` before `name`. Output the exact matched `nickname` or `alias` in `participants_raw` when possible.
+- **"on <name>" / "<name> pe" / "<name> ke naam"** (e.g., "add 200 on rishabh", "200 rishabh pe likh do"):
+  * Means the entire expense is owed by that friend (you paid for them).
+  * Set `payer_raw = "me"` and `participants_raw = ["rishabh"]` (do NOT include `"me"`).
+- **"split with <name>" / "with <name>" / "<name> ke saath"** (e.g., "add 200 split with rishabh", "dinner 500 with sahaj"):
+  * Means a shared equal split including you.
+  * Set `payer_raw = "me"` and `participants_raw = ["me", "rishabh"]`.
 
 ### COMPLEXITY HEURISTICS (`is_complex`)
 Mark `is_complex = True` IF:

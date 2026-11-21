@@ -11,7 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models.expense import Expense, ExpenseSplit
 from app.models.settlement import Settlement
-from app.models.user import User
+from app.models.user import Friendship, User
 from app.schemas.ledger import (
     BalanceSummary,
     ExpenseRead,
@@ -183,15 +183,25 @@ async def get_user_balances(
             # Payer paid caller money: reduces what payer owes caller
             net_by_user[s.payer_id] -= s.amount
 
-    # Fetch user names for friends in balance map
+    # Fetch user names and custom nicknames for friends in balance map
     other_user_ids = list(net_by_user.keys())
     user_names: dict[uuid.UUID, str] = {}
+    user_nicknames: dict[uuid.UUID, str | None] = {}
     if other_user_ids:
         users_result = await session.execute(
             select(User).where(User.id.in_(other_user_ids))
         )
         for u in users_result.scalars().all():
             user_names[u.id] = u.name
+
+        ships_result = await session.execute(
+            select(Friendship).where(
+                Friendship.user_id == user_id,
+                Friendship.friend_id.in_(other_user_ids),
+            )
+        )
+        for s in ships_result.scalars().all():
+            user_nicknames[s.friend_id] = s.nickname
 
     total_owed_to_you = Decimal("0.00")
     total_you_owe = Decimal("0.00")
@@ -207,6 +217,7 @@ async def get_user_balances(
             UserBalance(
                 user_id=other_id,
                 user_name=user_names.get(other_id, "Unknown"),
+                nickname=user_nicknames.get(other_id),
                 net_balance=net,
             )
         )

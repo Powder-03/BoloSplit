@@ -15,9 +15,11 @@ You receive:
    - If exactly ONE clear candidate matches: set `action_type` to UPDATE or DELETE, `target_record_id`, `target_source = 'verified'`, and `confidence = "HIGH"`.
    - If TWO OR MORE conflicting candidates match: set `confidence = "AMBIGUOUS"`, populate `ambiguous_candidate_ids`, and create a natural `clarification_question`.
 
-2. **Group Entity Resolution:**
+2. **Group & Friend Alias Resolution:**
    - If `group_raw` is mentioned (e.g. "Goa Trip", "flatmates"): match against `user_groups` by name or alias, and set `group_id`.
    - If no participants are explicitly mentioned for a group expense, default participants to ALL members of that group!
+   - When matching friends in `user_directory`, prioritize each friend's custom `nickname` and `aliases` over `name`.
+   - Respect `participants_raw` split intent: if `participants_raw` only names a friend (e.g. `"add 200 on rishabh"` -> `["rishabh"]` without `"me"`), assign 100% of `owed_amount` to that friend; if `"me"` is included (e.g. `"split with rishabh"` -> `["me", "rishabh"]`), split among all listed participants.
 
 3. **Settlement ('Settle Up') Resolution:**
    - If intent is `SETTLE`: map `payee_raw` from `settle_item` to a user in `user_directory` (`payee_user_id`).
