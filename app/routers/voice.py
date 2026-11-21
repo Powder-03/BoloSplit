@@ -29,8 +29,20 @@ async def ingest_voice_text(
     """
     Ingest a text voice command (e.g., 'Add 500 for petrol split with Sahaj').
 
-    Isolates input into the review queue (`staged_expenses`) without mutating the ledger.
+    Validates confidence and entity resolution strictly before mutating the ledger.
     """
+    if not payload.text or not payload.text.strip():
+        msg = "Sound was not clear. Please speak again clearly."
+        return VoiceIngestResponse(
+            status="ERROR",
+            action_type="UNKNOWN",
+            count=0,
+            error_code="UNCLEAR_AUDIO",
+            spoken_confirmation=msg,
+            clarification_prompt=msg,
+            is_ambiguous=False,
+        )
+
     return await ai_pipeline.process_voice_pipeline(
         session=session,
         user=current_user,
@@ -73,7 +85,11 @@ async def ingest_voice_audio(
             model=settings.STAGE1_MODEL,
             contents=[
                 types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                "Transcribe this Hinglish/Indian English voice recording accurately. Output only the verbatim transcript.",
+                (
+                    "Transcribe this Hinglish/Indian English voice recording accurately. "
+                    "If the audio is silent, too noisy, garbled, or unintelligible so you cannot "
+                    "hear clear words, output only: [UNCLEAR]. Otherwise output only the verbatim transcript."
+                ),
             ],
         )
         transcribed_text = response.text.strip() if response.text else ""
@@ -83,10 +99,22 @@ async def ingest_voice_audio(
             detail=f"Audio perception failed: {exc}",
         ) from exc
 
-    if not transcribed_text:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Could not detect clear speech in audio recording.",
+    cleaned_marker = transcribed_text.strip("[](). ").upper()
+    if not transcribed_text or "[UNCLEAR]" in transcribed_text.upper() or cleaned_marker in {
+        "UNCLEAR",
+        "INAUDIBLE",
+        "NO_SPEECH",
+        "SILENCE",
+    }:
+        msg = "Sound was not clear. Please speak again clearly."
+        return VoiceIngestResponse(
+            status="ERROR",
+            action_type="UNKNOWN",
+            count=0,
+            error_code="UNCLEAR_AUDIO",
+            spoken_confirmation=msg,
+            clarification_prompt=msg,
+            is_ambiguous=False,
         )
 
     return await ai_pipeline.process_voice_pipeline(

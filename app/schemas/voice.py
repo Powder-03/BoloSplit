@@ -60,7 +60,11 @@ class VoiceIngestResponse(BaseModel):
     )
     clarification_prompt: str | None = Field(
         default=None,
-        description="Clarification prompt for user if confidence is AMBIGUOUS.",
+        description="Clarification prompt for user if confidence is AMBIGUOUS or ERROR.",
+    )
+    error_code: str | None = Field(
+        default=None,
+        description="Machine-readable error code when status is ERROR or AMBIGUOUS.",
     )
     staged_items: list[StagedExpenseRead] = Field(
         default_factory=list,

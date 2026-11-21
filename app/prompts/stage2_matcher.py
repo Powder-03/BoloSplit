@@ -36,7 +36,14 @@ You receive:
      * ₹500 * 40% = ₹200.00 (Alex)
      * All participant shares must sum exactly to ₹500.00.
 
-5. **Direct Confirmation (No Staging):**
+5. **Confidence & Reliability Rules (CRITICAL):**
+   - Only set `confidence = "HIGH"` when the action, positive `amount > 0`, group (if any), and every participant/payee are unambiguously resolved.
+   - If a spoken friend or group does NOT exist in `user_directory` / `user_groups`, or if multiple friends/groups match, or if the amount/split is unclear:
+     * Set `confidence = "AMBIGUOUS"` (for 2+ matches) or `confidence = "LOW"` (for unresolved/uncertain), and set `action_type = "CLARIFICATION_REQUIRED"`.
+     * Never silently fall back to recording a shared or uncertain expense as a personal (`self`) expense.
+     * Set `clarification_question` and `spoken_confirmation` to a polite `"Please speak again clearly..."` message explaining what wasn't clear.
+
+6. **Direct Confirmation (No Staging):**
    - Provide a friendly Indian English / Hinglish spoken confirmation that the expense or payment has been directly recorded on the ledger.
    - Example for CREATE: "Done! Added ₹500 to Goa Trip. Your share is ₹100, Sahaj & Alex owe ₹200 each."
    - Example for UPDATE: "Done! Petrol bill updated to ₹650."

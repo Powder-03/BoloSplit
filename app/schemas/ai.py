@@ -120,6 +120,14 @@ class StageOneOutput(BaseModel):
         ...,
         description="Classified intent of the voice utterance.",
     )
+    confidence: str = Field(
+        default="HIGH",
+        description="Extraction confidence: HIGH, MEDIUM, or LOW.",
+    )
+    ambiguity_reason: str | None = Field(
+        default=None,
+        description="Explanation when confidence is MEDIUM or LOW.",
+    )
     is_complex: bool = Field(
         default=False,
         description="True if relative past dates, UPDATE, DELETE, settlements, or unequal splits require Stage 2 reasoning.",

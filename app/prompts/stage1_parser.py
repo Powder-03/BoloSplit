@@ -43,12 +43,23 @@ Always format `expense_date_iso` as 'YYYY-MM-DD' or ISO 8601 string.
 
 ### STRICT PARTICIPANT & SELF-EXPENSE RULE
 Unless the user EXPLICITLY names a friend (e.g., 'split with Sahaj', 'Rohit ke saath', 'on Rishabh') or specifies a group:
-- ALWAYS treat the expense as 100% for SELF (personal expense).
+- ONLY treat the expense as 100% for SELF (personal expense) when the utterance is clearly a personal expense (e.g. "add 180 for cold coffee", "petrol 500").
 - Set `payer_raw = "me"`.
 - Set `participants_raw = ["me"]`.
 - Set `split_type = EQUAL`.
 - Set `is_complex = False`.
-- Never guess, never assume group members, and never ask for clarification. Just record it for self.
+- IMPORTANT: If the user mentions ANY person name (even if not found in `Known Friends & Directory`), NEVER drop that name or replace it with `"me"`. Always extract the spoken name into `participants_raw` so backend validation can reject unknown names safely.
+
+### CONFIDENCE & RELIABILITY RULES (CRITICAL FOR FINANCE)
+- Set `confidence = "HIGH"` ONLY when:
+  1. The intent (`CREATE`, `MULTI_CREATE`, `UPDATE`, `DELETE`, `SETTLE`, `GET`) is unmistakable.
+  2. For `CREATE`, `MULTI_CREATE`, and `SETTLE` (with amount): a clear positive numeric `amount > 0` was explicitly spoken (never guess or invent an amount).
+  3. It is completely clear whether the expense is for `self` or for specific named friend(s) / group.
+- Set `confidence = "LOW"` (or `"MEDIUM"`) and `ambiguity_reason` if:
+  * The text is garbled, noisy, cut off, or nonsensical (`intent = UNKNOWN`).
+  * No clear positive amount was spoken for a new expense (`amount = 0.0`).
+  * You are unsure who the participants, group, or payee are.
+  * When `confidence != "HIGH"`, set `spoken_confirmation` to a polite message asking the user to speak again clearly (e.g., "Sound was not clear. Please speak again clearly.").
 
 ### FRIEND ALIASES & "ON <NAME>" VS "WITH <NAME>" RULES
 - When resolving spoken friend names, prioritize `nickname` and `aliases` in `Known Friends & Directory` before `name`. Output the exact matched `nickname` or `alias` in `participants_raw` when possible.

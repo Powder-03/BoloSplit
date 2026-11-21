@@ -139,19 +139,65 @@ async def get_user_groups_context(
     return groups_data
 
 
+def _score_group_match(raw_clean: str, group: dict[str, Any]) -> tuple[int, int] | None:
+    """Score how well a spoken group name matches a user group."""
+    g_name = str(group.get("name", "")).strip().lower()
+    aliases = [str(a).strip().lower() for a in group.get("aliases", []) if a and str(a).strip()]
+    candidates = ([g_name] if g_name else []) + aliases
+
+    if raw_clean in candidates:
+        return (1, -len(raw_clean))
+
+    raw_word_pat = re.compile(rf"\b{re.escape(raw_clean)}\b")
+    for cand in candidates:
+        if raw_word_pat.search(cand) or re.search(rf"\b{re.escape(cand)}\b", raw_clean):
+            return (2, -len(cand))
+
+    if len(raw_clean) >= 3:
+        for cand in candidates:
+            if len(cand) >= 3 and (raw_clean in cand or cand in raw_clean):
+                return (3, -len(cand))
+
+    return None
+
+
+def resolve_group_strict(
+    group_raw: str | None,
+    user_groups: list[dict[str, Any]],
+) -> tuple[uuid.UUID | None, list[dict[str, Any]]]:
+    """
+    Resolve a spoken group name strictly, returning (resolved_id, matching_groups).
+
+    - 1 unique best match -> (UUID, [group])
+    - 0 matches -> (None, [])
+    - 2+ tied matches -> (None, [group1, group2, ...])
+    """
+    if not group_raw or not group_raw.strip():
+        return None, []
+    raw_clean = group_raw.strip().lower()
+
+    best_score: tuple[int, int] | None = None
+    tied_groups: list[dict[str, Any]] = []
+
+    for g in user_groups:
+        score = _score_group_match(raw_clean, g)
+        if score is None:
+            continue
+        if best_score is None or score < best_score:
+            best_score = score
+            tied_groups = [g]
+        elif score == best_score:
+            tied_groups.append(g)
+
+    if len(tied_groups) == 1:
+        return uuid.UUID(tied_groups[0]["group_id"]), tied_groups
+    return None, tied_groups
+
+
 def resolve_group_id(group_raw: str | None, user_groups: list[dict[str, Any]]) -> uuid.UUID | None:
     """Fuzzy match raw spoken group name to an actual group ID."""
-    if not group_raw:
-        return None
-    raw_clean = group_raw.strip().lower()
-    for g in user_groups:
-        g_name = g["name"].lower()
-        if raw_clean == g_name or raw_clean in g_name or g_name in raw_clean:
-            return uuid.UUID(g["group_id"])
-        for alias in g.get("aliases", []):
-            if raw_clean == alias or raw_clean in alias or alias in raw_clean:
-                return uuid.UUID(g["group_id"])
-    return None
+    resolved_id, _ = resolve_group_strict(group_raw, user_groups)
+    return resolved_id
 
 
 def _score_member_match(raw_clean: str, member: dict[str, Any]) -> tuple[int, int] | None:
@@ -201,14 +247,18 @@ def _score_member_match(raw_clean: str, member: dict[str, Any]) -> tuple[int, in
     return None
 
 
-def resolve_participant_ids(
+def resolve_participants_strict(
     raw_names: list[str],
     user_directory: list[dict[str, Any]],
     caller_id: uuid.UUID,
     group_members: list[dict[str, Any]] | None = None,
-) -> list[uuid.UUID]:
-    """Map spoken raw participant names to verified User IDs using ranked alias & name matching."""
-    # Combine directory with group members if available
+) -> tuple[list[uuid.UUID], list[str], list[tuple[str, list[dict[str, Any]]]]]:
+    """
+    Strictly resolve spoken participant names without silent fallback to caller_id.
+
+    Returns:
+        (matched_ids, unmatched_names, ambiguous_matches)
+    """
     combined_directory = list(user_directory)
     if group_members:
         existing_ids = {d["user_id"] for d in combined_directory}
@@ -226,6 +276,8 @@ def resolve_participant_ids(
                 )
 
     matched_ids: set[uuid.UUID] = set()
+    unmatched_names: list[str] = []
+    ambiguous_matches: list[tuple[str, list[dict[str, Any]]]] = []
 
     for raw in raw_names:
         raw_clean = raw.strip().lower()
@@ -234,32 +286,64 @@ def resolve_participant_ids(
         if raw_clean in ["me", "myself", "i", "maine", "mera"]:
             matched_ids.add(caller_id)
             continue
+        if raw_clean in ["all", "sab", "everyone"] and group_members:
+            matched_ids.add(caller_id)
+            for gm in group_members:
+                matched_ids.add(uuid.UUID(gm["user_id"]))
+            continue
 
-        best_score: tuple[int, int, int] | None = None
-        best_member_id: uuid.UUID | None = None
+        best_score: tuple[int, int] | None = None
+        tied_members: list[dict[str, Any]] = []
 
-        for idx, member in enumerate(combined_directory):
+        for member in combined_directory:
             if member.get("is_caller"):
                 continue
             score = _score_member_match(raw_clean, member)
-            if score is not None:
-                ranked = (score[0], score[1], idx)
-                if best_score is None or ranked < best_score:
-                    best_score = ranked
-                    best_member_id = uuid.UUID(member["user_id"])
+            if score is None:
+                continue
+            if best_score is None or score < best_score:
+                best_score = score
+                tied_members = [member]
+            elif score == best_score:
+                tied_members.append(member)
 
-        if best_member_id is not None:
-            matched_ids.add(best_member_id)
+        if len(tied_members) == 1:
+            matched_ids.add(uuid.UUID(tied_members[0]["user_id"]))
+        elif len(tied_members) >= 2:
+            ambiguous_matches.append((raw.strip(), tied_members))
+        else:
+            unmatched_names.append(raw.strip())
 
-    # Fallback to caller only if no participant matched, or caller was explicitly included
-    if not matched_ids:
-        matched_ids.add(caller_id)
-    elif caller_id not in matched_ids and any(
-        r.strip().lower() in ["me", "myself", "i", "all", "sab"] for r in raw_names
+    if matched_ids and caller_id not in matched_ids and any(
+        r.strip().lower() in ["me", "myself", "i", "all", "sab", "everyone"] for r in raw_names
     ):
         matched_ids.add(caller_id)
 
-    return list(matched_ids)
+    return list(matched_ids), unmatched_names, ambiguous_matches
+
+
+def resolve_participant_ids(
+    raw_names: list[str],
+    user_directory: list[dict[str, Any]],
+    caller_id: uuid.UUID,
+    group_members: list[dict[str, Any]] | None = None,
+) -> list[uuid.UUID]:
+    """Map spoken raw participant names to verified User IDs using ranked alias & name matching."""
+    matched_ids, _, ambiguous_matches = resolve_participants_strict(
+        raw_names=raw_names,
+        user_directory=user_directory,
+        caller_id=caller_id,
+        group_members=group_members,
+    )
+    resolved = set(matched_ids)
+    for _, tied in ambiguous_matches:
+        if tied:
+            resolved.add(uuid.UUID(tied[0]["user_id"]))
+
+    if not resolved:
+        resolved.add(caller_id)
+
+    return list(resolved)
 
 
 async def search_verified_candidates(
@@ -302,6 +386,35 @@ async def search_db_candidates(
     """Search candidates across staged (empty) and verified expenses for backward compatibility."""
     verified = await search_verified_candidates(session, user_id, keywords, target_date, window_days)
     return [], verified
+
+
+def _voice_rejection(
+    error_code: str,
+    message: str,
+    action_type: str = "CREATE",
+    is_ambiguous: bool = False,
+    status: str = "ERROR",
+) -> VoiceIngestResponse:
+    """Build a consistent non-mutating VoiceIngestResponse when confidence/resolution fails."""
+    return VoiceIngestResponse(
+        status=status,
+        action_type=action_type,
+        count=0,
+        expenses=[],
+        spoken_confirmation=message,
+        clarification_prompt=message,
+        error_code=error_code,
+        is_ambiguous=is_ambiguous,
+    )
+
+
+def _format_candidate_label(member: dict[str, Any]) -> str:
+    """Format a directory member with nickname if available for clarification messages."""
+    nick = member.get("nickname")
+    name = member.get("name", "Friend")
+    if nick and nick.strip().lower() != name.strip().lower():
+        return f"{nick} ({name})"
+    return name
 
 
 async def process_voice_pipeline(
@@ -362,33 +475,113 @@ User Voice Utterance:
     stage1_output = StageOneOutput.model_validate_json(stage1_response.text)
 
     # -------------------------------------------------------------
+    # GATE 1: Stage 1 Intent & Confidence Gate
+    # -------------------------------------------------------------
+    stage1_conf = (stage1_output.confidence or "HIGH").strip().upper()
+    if stage1_output.intent == IntentType.UNKNOWN:
+        msg = (
+            stage1_output.spoken_confirmation
+            or "Sound was not clear or I couldn't understand that. Please speak again clearly."
+        )
+        return _voice_rejection("LOW_CONFIDENCE", msg, action_type="UNKNOWN")
+
+    if stage1_conf != "HIGH":
+        msg = (
+            stage1_output.spoken_confirmation
+            or "I wasn't completely sure what you said. Please speak again clearly."
+        )
+        return _voice_rejection("LOW_CONFIDENCE", msg, action_type=str(stage1_output.intent))
+
+    # -------------------------------------------------------------
     # FAST PATH: Simple CREATE or MULTI_CREATE with is_complex == False
-    # (Directly committed to the verified ledger with zero staging ceremony!)
+    # (Directly committed to the verified ledger after strict validation!)
     # -------------------------------------------------------------
     if not stage1_output.is_complex and stage1_output.intent in [
         IntentType.CREATE,
         IntentType.MULTI_CREATE,
     ]:
-        created_expenses: list[ExpenseRead] = []
+        if not stage1_output.items:
+            return _voice_rejection(
+                "LOW_CONFIDENCE",
+                "Couldn't catch the expense details. Please speak again clearly.",
+                action_type="CREATE",
+            )
+
+        # Validate ALL items before committing anything (atomic for MULTI_CREATE)
+        prepared_items: list[tuple[Any, uuid.UUID | None, list[uuid.UUID], Decimal, datetime]] = []
 
         for item in stage1_output.items:
-            # Resolve group if any
-            resolved_gid = group_id or resolve_group_id(item.group_raw, user_groups)
+            amt_decimal = Decimal(str(item.amount))
+            if amt_decimal <= Decimal("0.00"):
+                return _voice_rejection(
+                    "INVALID_AMOUNT",
+                    "Couldn't catch a valid amount. Please speak again clearly with the amount.",
+                    action_type="CREATE",
+                )
 
-            # Resolve participants
+            if not item.description or not item.description.strip():
+                return _voice_rejection(
+                    "LOW_CONFIDENCE",
+                    "Couldn't catch what the expense was for. Please speak again clearly.",
+                    action_type="CREATE",
+                )
+
+            # Resolve group strictly if spoken (or use explicit client group_id)
+            resolved_gid = group_id
+            if not resolved_gid and item.group_raw:
+                resolved_gid, matching_groups = resolve_group_strict(item.group_raw, user_groups)
+                if len(matching_groups) >= 2:
+                    opts = ", ".join(g["name"] for g in matching_groups)
+                    return _voice_rejection(
+                        "AMBIGUOUS_GROUP",
+                        f"Found multiple groups matching '{item.group_raw}' ({opts}). Please speak again with the full group name.",
+                        action_type="CREATE",
+                        is_ambiguous=True,
+                        status="AMBIGUOUS",
+                    )
+                if not resolved_gid:
+                    return _voice_rejection(
+                        "UNKNOWN_GROUP",
+                        f"Couldn't find group '{item.group_raw}'. Please speak again with the exact group name.",
+                        action_type="CREATE",
+                    )
+
             group_mems = None
             if resolved_gid:
                 matched_g = next((g for g in user_groups if g["group_id"] == str(resolved_gid)), None)
                 if matched_g:
                     group_mems = matched_g["members"]
 
-            p_ids = resolve_participant_ids(item.participants_raw, user_directory, user.id, group_mems)
-            if not p_ids and group_mems:
-                p_ids = [uuid.UUID(m["user_id"]) for m in group_mems]
-            if not p_ids:
-                p_ids = [user.id]
+            p_ids, unmatched_names, ambiguous_matches = resolve_participants_strict(
+                item.participants_raw, user_directory, user.id, group_mems
+            )
+            if ambiguous_matches:
+                raw_name, tied_members = ambiguous_matches[0]
+                opts = ", ".join(_format_candidate_label(m) for m in tied_members)
+                return _voice_rejection(
+                    "AMBIGUOUS_FRIEND",
+                    f"Found multiple friends matching '{raw_name}' ({opts}). Please speak again using their nickname.",
+                    action_type="CREATE",
+                    is_ambiguous=True,
+                    status="AMBIGUOUS",
+                )
+            if unmatched_names:
+                return _voice_rejection(
+                    "UNKNOWN_FRIEND",
+                    f"Couldn't find friend '{unmatched_names[0]}'. Please speak again using their nickname or add them first.",
+                    action_type="CREATE",
+                )
 
-            # Expense date
+            if not p_ids:
+                if group_mems:
+                    p_ids = [uuid.UUID(m["user_id"]) for m in group_mems]
+                else:
+                    return _voice_rejection(
+                        "LOW_CONFIDENCE",
+                        "I wasn't sure who to add this expense for. Please speak again clearly.",
+                        action_type="CREATE",
+                    )
+
             item_date = datetime.now(UTC)
             if item.expense_date_iso:
                 try:
@@ -397,11 +590,15 @@ User Voice Utterance:
                 except ValueError:
                     pass
 
-            amt_decimal = Decimal(str(item.amount))
+            prepared_items.append((item, resolved_gid, p_ids, amt_decimal, item_date))
 
+        created_expenses: list[ExpenseRead] = []
+        created_ids: list[uuid.UUID] = []
+
+        for item, resolved_gid, p_ids, amt_decimal, item_date in prepared_items:
             expense = Expense(
                 group_id=resolved_gid,
-                description=item.description,
+                description=item.description.strip(),
                 amount=amt_decimal,
                 currency=item.currency,
                 payer_id=user.id,
@@ -412,24 +609,25 @@ User Voice Utterance:
             session.add(expense)
             await session.flush()
 
-            # Equal split calculation
             splits_calc = calculate_equal_splits(amt_decimal, p_ids, payer_id=user.id)
             for uid, owed in splits_calc:
-                split = ExpenseSplit(
-                    expense_id=expense.id,
-                    user_id=uid,
-                    owed_amount=owed,
-                    split_type="EQUAL",
+                session.add(
+                    ExpenseSplit(
+                        expense_id=expense.id,
+                        user_id=uid,
+                        owed_amount=owed,
+                        split_type="EQUAL",
+                    )
                 )
-                session.add(split)
+            created_ids.append(expense.id)
 
-            await session.commit()
+        await session.commit()
 
-            # Load created with splits
+        for exp_id in created_ids:
             fetch_q = (
                 select(Expense)
                 .options(selectinload(Expense.splits))
-                .where(Expense.id == expense.id)
+                .where(Expense.id == exp_id)
             )
             saved = (await session.execute(fetch_q)).scalars().first()
             created_expenses.append(ExpenseRead.model_validate(saved))
@@ -449,60 +647,97 @@ User Voice Utterance:
     # -------------------------------------------------------------
     if stage1_output.intent == IntentType.SETTLE and stage1_output.settle_item:
         s_item = stage1_output.settle_item
-        payee_ids = resolve_participant_ids([s_item.payee_raw], user_directory, user.id)
-        # Exclude caller from payee
-        target_payee_id = next((pid for pid in payee_ids if pid != user.id), None)
-        if not target_payee_id and user_balances.balances:
-            # If payee name was ambiguous, use the friend with largest debt
-            target_payee_id = user_balances.balances[0].user_id
-
-        if target_payee_id:
-            settle_amt = Decimal(str(s_item.amount))
-            resolved_gid = group_id or resolve_group_id(s_item.group_raw, user_groups)
-
-            settlement = Settlement(
-                payer_id=user.id,
-                payee_id=target_payee_id,
-                amount=settle_amt,
-                currency=s_item.currency,
-                group_id=resolved_gid,
-                payment_method=s_item.payment_method or "UPI",
-                notes=s_item.notes or "Voice settle up",
-                settlement_date=datetime.now(UTC),
-                is_deleted=False,
-            )
-            session.add(settlement)
-            await session.commit()
-            await session.refresh(settlement)
-
-            payee_user = (await session.execute(select(User).where(User.id == target_payee_id))).scalars().first()
-            payee_name = payee_user.name if payee_user else s_item.payee_raw
-
-            conf = stage1_output.spoken_confirmation or f"Done! Settle up of ₹{settle_amt} paid to {payee_name} recorded."
-
-            return VoiceIngestResponse(
-                status="SUCCESS",
+        settle_amt = Decimal(str(s_item.amount))
+        if settle_amt <= Decimal("0.00"):
+            return _voice_rejection(
+                "INVALID_AMOUNT",
+                "Couldn't catch a valid settlement amount. Please speak again clearly.",
                 action_type="SETTLE",
-                count=1,
-                settlement=SettlementRead(
-                    id=settlement.id,
-                    payer_id=settlement.payer_id,
-                    payer_name=user.name,
-                    payee_id=settlement.payee_id,
-                    payee_name=payee_name,
-                    amount=settlement.amount,
-                    currency=settlement.currency,
-                    group_id=settlement.group_id,
-                    payment_method=settlement.payment_method,
-                    transaction_reference=settlement.transaction_reference,
-                    notes=settlement.notes,
-                    settlement_date=settlement.settlement_date,
-                    is_deleted=settlement.is_deleted,
-                    created_at=settlement.created_at,
-                ),
-                spoken_confirmation=conf,
-                is_ambiguous=False,
             )
+
+        resolved_gid = group_id
+        if not resolved_gid and s_item.group_raw:
+            resolved_gid, matching_groups = resolve_group_strict(s_item.group_raw, user_groups)
+            if len(matching_groups) >= 2:
+                opts = ", ".join(g["name"] for g in matching_groups)
+                return _voice_rejection(
+                    "AMBIGUOUS_GROUP",
+                    f"Found multiple groups matching '{s_item.group_raw}' ({opts}). Please speak again with the full group name.",
+                    action_type="SETTLE",
+                    is_ambiguous=True,
+                    status="AMBIGUOUS",
+                )
+            if not resolved_gid:
+                return _voice_rejection(
+                    "UNKNOWN_GROUP",
+                    f"Couldn't find group '{s_item.group_raw}'. Please speak again with the exact group name.",
+                    action_type="SETTLE",
+                )
+
+        payee_ids, unmatched_payees, ambiguous_payees = resolve_participants_strict(
+            [s_item.payee_raw], user_directory, user.id
+        )
+        if ambiguous_payees:
+            raw_name, tied_members = ambiguous_payees[0]
+            opts = ", ".join(_format_candidate_label(m) for m in tied_members)
+            return _voice_rejection(
+                "AMBIGUOUS_FRIEND",
+                f"Found multiple friends matching '{raw_name}' ({opts}). Please speak again using their nickname.",
+                action_type="SETTLE",
+                is_ambiguous=True,
+                status="AMBIGUOUS",
+            )
+        target_payee_id = next((pid for pid in payee_ids if pid != user.id), None)
+        if unmatched_payees or not target_payee_id:
+            return _voice_rejection(
+                "UNKNOWN_FRIEND",
+                f"Couldn't find friend '{s_item.payee_raw}' to settle with. Please speak again using their nickname.",
+                action_type="SETTLE",
+            )
+
+        settlement = Settlement(
+            payer_id=user.id,
+            payee_id=target_payee_id,
+            amount=settle_amt,
+            currency=s_item.currency,
+            group_id=resolved_gid,
+            payment_method=s_item.payment_method or "UPI",
+            notes=s_item.notes or "Voice settle up",
+            settlement_date=datetime.now(UTC),
+            is_deleted=False,
+        )
+        session.add(settlement)
+        await session.commit()
+        await session.refresh(settlement)
+
+        payee_user = (await session.execute(select(User).where(User.id == target_payee_id))).scalars().first()
+        payee_name = payee_user.name if payee_user else s_item.payee_raw
+
+        conf = stage1_output.spoken_confirmation or f"Done! Settle up of ₹{settle_amt} paid to {payee_name} recorded."
+
+        return VoiceIngestResponse(
+            status="SUCCESS",
+            action_type="SETTLE",
+            count=1,
+            settlement=SettlementRead(
+                id=settlement.id,
+                payer_id=settlement.payer_id,
+                payer_name=user.name,
+                payee_id=settlement.payee_id,
+                payee_name=payee_name,
+                amount=settlement.amount,
+                currency=settlement.currency,
+                group_id=settlement.group_id,
+                payment_method=settlement.payment_method,
+                transaction_reference=settlement.transaction_reference,
+                notes=settlement.notes,
+                settlement_date=settlement.settlement_date,
+                is_deleted=settlement.is_deleted,
+                created_at=settlement.created_at,
+            ),
+            spoken_confirmation=conf,
+            is_ambiguous=False,
+        )
 
     # -------------------------------------------------------------
     # FAST PATH: Voice GET BALANCE ("What do I owe Sahaj?")
@@ -586,17 +821,35 @@ User Voice Utterance:
     )
 
     stage2_output = StageTwoResolution.model_validate_json(stage2_response.text)
+    stage2_conf = (stage2_output.confidence or "HIGH").strip().upper()
 
     # Check for Ambiguity
-    if stage2_output.confidence == "AMBIGUOUS" or len(stage2_output.ambiguous_candidate_ids) >= 2:
+    if stage2_conf == "AMBIGUOUS" or len(stage2_output.ambiguous_candidate_ids) >= 2:
+        msg = (
+            stage2_output.clarification_question
+            or "Found multiple matching records. Please specify which one you mean."
+        )
         return VoiceIngestResponse(
             status="AMBIGUOUS",
             action_type=stage2_output.action_type,
             count=0,
-            spoken_confirmation=stage2_output.spoken_confirmation,
+            spoken_confirmation=stage2_output.spoken_confirmation or msg,
             is_ambiguous=True,
-            clarification_prompt=stage2_output.clarification_question
-            or "Found multiple matching records. Please specify which one you want to update.",
+            clarification_prompt=msg,
+            error_code="AMBIGUOUS_CANDIDATE",
+        )
+
+    # Gate on HIGH confidence for Stage 2 mutations
+    if stage2_conf != "HIGH" or stage2_output.action_type == "CLARIFICATION_REQUIRED":
+        msg = (
+            stage2_output.clarification_question
+            or stage2_output.spoken_confirmation
+            or "Sound or details were not clear enough. Please speak again clearly."
+        )
+        return _voice_rejection(
+            "LOW_CONFIDENCE",
+            msg,
+            action_type=stage2_output.action_type,
         )
 
     # -------------------------------------------------------------
@@ -605,17 +858,43 @@ User Voice Utterance:
 
     # Case A: Complex CREATE (with Percentage splits or Group resolution)
     if stage2_output.action_type == "CREATE":
-        resolved_gid = None
-        if stage2_output.group_id:
+        resolved_gid = group_id
+        if not resolved_gid and stage2_output.group_id:
             try:
                 resolved_gid = uuid.UUID(stage2_output.group_id)
             except ValueError:
                 pass
-        if not resolved_gid and stage1_output.items:
-            resolved_gid = group_id or resolve_group_id(stage1_output.items[0].group_raw, user_groups)
+        if not resolved_gid and stage1_output.items and stage1_output.items[0].group_raw:
+            resolved_gid, matching_groups = resolve_group_strict(
+                stage1_output.items[0].group_raw, user_groups
+            )
+            if len(matching_groups) >= 2:
+                opts = ", ".join(g["name"] for g in matching_groups)
+                return _voice_rejection(
+                    "AMBIGUOUS_GROUP",
+                    f"Found multiple groups matching '{stage1_output.items[0].group_raw}' ({opts}). Please speak again with the full group name.",
+                    action_type="CREATE",
+                    is_ambiguous=True,
+                    status="AMBIGUOUS",
+                )
+            if not resolved_gid:
+                return _voice_rejection(
+                    "UNKNOWN_GROUP",
+                    f"Couldn't find group '{stage1_output.items[0].group_raw}'. Please speak again with the exact group name.",
+                    action_type="CREATE",
+                )
 
         exp_amt = stage2_output.amount
-        exp_desc = stage2_output.description or (stage1_output.items[0].description if stage1_output.items else "Expense")
+        if exp_amt <= Decimal("0.00"):
+            return _voice_rejection(
+                "INVALID_AMOUNT",
+                "Couldn't catch a valid amount. Please speak again clearly with the amount.",
+                action_type="CREATE",
+            )
+
+        exp_desc = stage2_output.description or (
+            stage1_output.items[0].description if stage1_output.items else "Expense"
+        )
 
         payer_id = user.id
         if stage2_output.payer_user_id:
@@ -623,6 +902,92 @@ User Voice Utterance:
                 payer_id = uuid.UUID(stage2_output.payer_user_id)
             except ValueError:
                 pass
+
+        group_mems = None
+        if resolved_gid:
+            matched_g = next((g for g in user_groups if g["group_id"] == str(resolved_gid)), None)
+            if matched_g:
+                group_mems = matched_g["members"]
+
+        # Resolve and validate splits BEFORE adding Expense to session
+        first_item = stage1_output.items[0] if stage1_output.items else None
+        prepared_splits: list[tuple[uuid.UUID, Decimal, str]] = []
+
+        if first_item and first_item.split_type == SplitTypeHint.PERCENTAGE and first_item.percentage_splits:
+            pct_tuples: list[tuple[uuid.UUID, Decimal]] = []
+            for ps in first_item.percentage_splits:
+                p_uids, unmatched_ps, ambiguous_ps = resolve_participants_strict(
+                    [ps.participant_raw], user_directory, user.id, group_mems
+                )
+                if ambiguous_ps:
+                    raw_name, tied_members = ambiguous_ps[0]
+                    opts = ", ".join(_format_candidate_label(m) for m in tied_members)
+                    return _voice_rejection(
+                        "AMBIGUOUS_FRIEND",
+                        f"Found multiple friends matching '{raw_name}' ({opts}). Please speak again using their nickname.",
+                        action_type="CREATE",
+                        is_ambiguous=True,
+                        status="AMBIGUOUS",
+                    )
+                if unmatched_ps or not p_uids:
+                    return _voice_rejection(
+                        "UNKNOWN_FRIEND",
+                        f"Couldn't find friend '{ps.participant_raw}'. Please speak again using their nickname or add them first.",
+                        action_type="CREATE",
+                    )
+                pct_tuples.append((p_uids[0], Decimal(str(ps.percentage))))
+
+            if pct_tuples and sum(pct for _, pct in pct_tuples) == Decimal("100.00"):
+                calc_pct_splits = calculate_percentage_splits(exp_amt, pct_tuples, payer_id=payer_id)
+                for uid, owed in calc_pct_splits:
+                    prepared_splits.append((uid, owed, "PERCENTAGE"))
+            else:
+                return _voice_rejection(
+                    "UNRESOLVED_SPLIT",
+                    "The split percentages didn't add up to 100%. Please speak again clearly.",
+                    action_type="CREATE",
+                )
+        elif stage2_output.resolved_splits and any(s.user_id for s in stage2_output.resolved_splits):
+            for s in stage2_output.resolved_splits:
+                if s.user_id:
+                    prepared_splits.append((uuid.UUID(s.user_id), s.owed_amount, "EXACT"))
+        else:
+            raw_parts = first_item.participants_raw if first_item else []
+            if raw_parts:
+                p_ids, unmatched_names, ambiguous_matches = resolve_participants_strict(
+                    raw_parts, user_directory, user.id, group_mems
+                )
+                if ambiguous_matches:
+                    raw_name, tied_members = ambiguous_matches[0]
+                    opts = ", ".join(_format_candidate_label(m) for m in tied_members)
+                    return _voice_rejection(
+                        "AMBIGUOUS_FRIEND",
+                        f"Found multiple friends matching '{raw_name}' ({opts}). Please speak again using their nickname.",
+                        action_type="CREATE",
+                        is_ambiguous=True,
+                        status="AMBIGUOUS",
+                    )
+                if unmatched_names:
+                    return _voice_rejection(
+                        "UNKNOWN_FRIEND",
+                        f"Couldn't find friend '{unmatched_names[0]}'. Please speak again using their nickname or add them first.",
+                        action_type="CREATE",
+                    )
+            elif group_mems:
+                p_ids = [uuid.UUID(m["user_id"]) for m in group_mems]
+            else:
+                p_ids = []
+
+            if not p_ids:
+                return _voice_rejection(
+                    "UNRESOLVED_SPLIT",
+                    "I wasn't sure who to split this expense with. Please speak again clearly.",
+                    action_type="CREATE",
+                )
+
+            splits_calc = calculate_equal_splits(exp_amt, p_ids, payer_id=payer_id)
+            for uid, owed in splits_calc:
+                prepared_splits.append((uid, owed, "EQUAL"))
 
         expense = Expense(
             group_id=resolved_gid,
@@ -637,63 +1002,15 @@ User Voice Utterance:
         session.add(expense)
         await session.flush()
 
-        # Handle percentage splits from Stage 1 or Stage 2
-        first_item = stage1_output.items[0] if stage1_output.items else None
-        if first_item and first_item.split_type == SplitTypeHint.PERCENTAGE and first_item.percentage_splits:
-            # Map percentages to participant IDs
-            pct_tuples: list[tuple[uuid.UUID, Decimal]] = []
-            for ps in first_item.percentage_splits:
-                p_uid_list = resolve_participant_ids([ps.participant_raw], user_directory, user.id)
-                if p_uid_list:
-                    pct_tuples.append((p_uid_list[0], Decimal(str(ps.percentage))))
-
-            if pct_tuples and sum(pct for _, pct in pct_tuples) == Decimal("100.00"):
-                calc_pct_splits = calculate_percentage_splits(exp_amt, pct_tuples, payer_id=payer_id)
-                for uid, owed in calc_pct_splits:
-                    session.add(
-                        ExpenseSplit(
-                            expense_id=expense.id,
-                            user_id=uid,
-                            owed_amount=owed,
-                            split_type="PERCENTAGE",
-                        )
-                    )
-            else:
-                # Fallback to resolved splits from Stage 2
-                for s in stage2_output.resolved_splits:
-                    if s.user_id:
-                        session.add(
-                            ExpenseSplit(
-                                expense_id=expense.id,
-                                user_id=uuid.UUID(s.user_id),
-                                owed_amount=s.owed_amount,
-                                split_type="EXACT",
-                            )
-                        )
-        elif stage2_output.resolved_splits and any(s.user_id for s in stage2_output.resolved_splits):
-            for s in stage2_output.resolved_splits:
-                if s.user_id:
-                    session.add(
-                        ExpenseSplit(
-                            expense_id=expense.id,
-                            user_id=uuid.UUID(s.user_id),
-                            owed_amount=s.owed_amount,
-                            split_type="EXACT",
-                        )
-                    )
-        else:
-            # Default equal split among resolved participants
-            p_ids = [user.id]
-            splits_calc = calculate_equal_splits(exp_amt, p_ids, payer_id=payer_id)
-            for uid, owed in splits_calc:
-                session.add(
-                    ExpenseSplit(
-                        expense_id=expense.id,
-                        user_id=uid,
-                        owed_amount=owed,
-                        split_type="EQUAL",
-                    )
+        for uid, owed, stype in prepared_splits:
+            session.add(
+                ExpenseSplit(
+                    expense_id=expense.id,
+                    user_id=uid,
+                    owed_amount=owed,
+                    split_type=stype,
                 )
+            )
 
         await session.commit()
 
@@ -784,63 +1101,75 @@ User Voice Utterance:
 
     # Case D: SETTLE via Stage 2
     if stage2_output.action_type == "SETTLE":
+        if stage2_output.amount <= Decimal("0.00"):
+            return _voice_rejection(
+                "INVALID_AMOUNT",
+                "Couldn't catch a valid settlement amount. Please speak again clearly.",
+                action_type="SETTLE",
+            )
+
         target_payee_id = None
         if stage2_output.payee_user_id:
             try:
                 target_payee_id = uuid.UUID(stage2_output.payee_user_id)
             except ValueError:
                 pass
-        if not target_payee_id and user_balances.balances:
-            target_payee_id = user_balances.balances[0].user_id
 
-        if target_payee_id:
-            settlement = Settlement(
-                payer_id=user.id,
-                payee_id=target_payee_id,
-                amount=stage2_output.amount,
-                currency=stage2_output.currency or "INR",
-                group_id=uuid.UUID(stage2_output.group_id) if stage2_output.group_id else None,
-                payment_method="UPI",
-                notes="Voice settle up",
-                settlement_date=datetime.now(UTC),
-                is_deleted=False,
-            )
-            session.add(settlement)
-            await session.commit()
-            await session.refresh(settlement)
-
-            payee_user = (await session.execute(select(User).where(User.id == target_payee_id))).scalars().first()
-            payee_name = payee_user.name if payee_user else "Friend"
-
-            return VoiceIngestResponse(
-                status="SUCCESS",
+        if not target_payee_id:
+            return _voice_rejection(
+                "UNKNOWN_FRIEND",
+                "I wasn't sure which friend you settled with. Please speak again using their name or nickname.",
                 action_type="SETTLE",
-                count=1,
-                settlement=SettlementRead(
-                    id=settlement.id,
-                    payer_id=settlement.payer_id,
-                    payer_name=user.name,
-                    payee_id=settlement.payee_id,
-                    payee_name=payee_name,
-                    amount=settlement.amount,
-                    currency=settlement.currency,
-                    group_id=settlement.group_id,
-                    payment_method=settlement.payment_method,
-                    transaction_reference=settlement.transaction_reference,
-                    notes=settlement.notes,
-                    settlement_date=settlement.settlement_date,
-                    is_deleted=settlement.is_deleted,
-                    created_at=settlement.created_at,
-                ),
-                spoken_confirmation=stage2_output.spoken_confirmation
-                or f"Done! Settled ₹{settlement.amount} with {payee_name}.",
-                is_ambiguous=False,
             )
 
-    # Fallback
-    return VoiceIngestResponse(
-        status="SUCCESS",
+        settlement = Settlement(
+            payer_id=user.id,
+            payee_id=target_payee_id,
+            amount=stage2_output.amount,
+            currency=stage2_output.currency or "INR",
+            group_id=uuid.UUID(stage2_output.group_id) if stage2_output.group_id else None,
+            payment_method="UPI",
+            notes="Voice settle up",
+            settlement_date=datetime.now(UTC),
+            is_deleted=False,
+        )
+        session.add(settlement)
+        await session.commit()
+        await session.refresh(settlement)
+
+        payee_user = (await session.execute(select(User).where(User.id == target_payee_id))).scalars().first()
+        payee_name = payee_user.name if payee_user else "Friend"
+
+        return VoiceIngestResponse(
+            status="SUCCESS",
+            action_type="SETTLE",
+            count=1,
+            settlement=SettlementRead(
+                id=settlement.id,
+                payer_id=settlement.payer_id,
+                payer_name=user.name,
+                payee_id=settlement.payee_id,
+                payee_name=payee_name,
+                amount=settlement.amount,
+                currency=settlement.currency,
+                group_id=settlement.group_id,
+                payment_method=settlement.payment_method,
+                transaction_reference=settlement.transaction_reference,
+                notes=settlement.notes,
+                settlement_date=settlement.settlement_date,
+                is_deleted=settlement.is_deleted,
+                created_at=settlement.created_at,
+            ),
+            spoken_confirmation=stage2_output.spoken_confirmation
+            or f"Done! Settled ₹{settlement.amount} with {payee_name}.",
+            is_ambiguous=False,
+        )
+
+    # Fallback: never report SUCCESS when no action was executed
+    return _voice_rejection(
+        "LOW_CONFIDENCE",
+        stage2_output.clarification_question
+        or stage2_output.spoken_confirmation
+        or "Couldn't complete that command clearly. Please speak again.",
         action_type=stage2_output.action_type,
-        spoken_confirmation=stage2_output.spoken_confirmation or "Command processed.",
-        is_ambiguous=False,
     )
