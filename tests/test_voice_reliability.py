@@ -369,20 +369,29 @@ async def test_settle_unknown_friend_does_not_pick_balance_fallback(client_with_
 
 @pytest.mark.asyncio
 async def test_stage2_medium_confidence_is_blocked(client_with_user):
-    client, _, session = client_with_user
+    client, caller, session = client_with_user
+
+    seed = await client.post(
+        "/expenses/self",
+        json={"description": "Dinner", "amount": "400.00", "category": "food"},
+    )
+    assert seed.status_code == 201
+    seed_id = seed.json()["id"]
 
     mock_s1 = StageOneOutput(
-        intent=IntentType.CREATE,
+        intent=IntentType.UPDATE,
         confidence="HIGH",
         is_complex=True,
-        items=[ExtractedItem(description="Dinner", amount=400.0, participants_raw=["me"])],
+        items=[ExtractedItem(description="Dinner", amount=450.0, scope="SELF", participants_raw=["me"])],
     )
     mock_s2 = StageTwoResolution(
-        action_type="CREATE",
+        action_type="UPDATE",
+        target_record_id=seed_id,
+        target_source="self",
         confidence="MEDIUM",
         description="Dinner",
-        amount=Decimal("400.00"),
-        clarification_question="Not sure which group or friends to split with. Please speak again.",
+        amount=Decimal("450.00"),
+        clarification_question="Not sure which dinner expense you meant. Please speak again.",
     )
     mock_client = MagicMock()
 
@@ -394,15 +403,77 @@ async def test_stage2_medium_confidence_is_blocked(client_with_user):
     mock_client.aio.models.generate_content = AsyncMock(side_effect=mock_gen)
 
     with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
-        resp = await client.post("/voice/text", json={"text": "Add 400 dinner yesterday"})
+        resp = await client.post("/voice/text", json={"text": "Update dinner to 450"})
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "ERROR"
     assert resp.json()["error_code"] == "LOW_CONFIDENCE"
     assert resp.json()["count"] == 0
 
-    expenses = (await session.execute(select(Expense))).scalars().all()
-    assert expenses == []
+    # Seeded self expense remained untouched
+    check = (await client.get(f"/expenses/self/{seed_id}")).json()
+    assert Decimal(str(check["amount"])) == Decimal("400.00")
+
+
+@pytest.mark.asyncio
+async def test_mixed_multi_create_separates_self_and_shared_expenses(client_with_user):
+    client, caller, session = client_with_user
+
+    f_res = (
+        await client.post(
+            "/friends",
+            json={"friend_phone": "+919877770011", "friend_name": "Rishabh", "nickname": "Rishabh"},
+        )
+    ).json()
+    rishabh_id = f_res["friend_id"]
+
+    mock_multi = StageOneOutput(
+        intent=IntentType.MULTI_CREATE,
+        confidence="HIGH",
+        is_complex=False,
+        items=[
+            ExtractedItem(
+                description="Coffee",
+                amount=120.0,
+                scope="SELF",
+                participants_raw=["me"],
+                category="food",
+            ),
+            ExtractedItem(
+                description="Lunch",
+                amount=500.0,
+                scope="SHARED",
+                participants_raw=["rishabh"],
+                category="food",
+            ),
+        ],
+        spoken_confirmation="Added ₹120 solo coffee and ₹500 on Rishabh.",
+    )
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_multi.model_dump_json())
+    )
+
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        resp = await client.post("/voice/text", json={"text": "120 coffee and 500 on Rishabh"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "SUCCESS"
+    assert data["count"] == 2
+    assert len(data["self_expenses"]) == 1
+    assert len(data["expenses"]) == 1
+    assert data["self_expenses"][0]["description"] == "Coffee"
+    assert data["expenses"][0]["description"] == "Lunch"
+    assert data["expenses"][0]["splits"][0]["user_id"] == rishabh_id
+
+    self_summary = (await client.get("/expenses/self")).json()
+    assert self_summary["total_count"] == 1
+    assert Decimal(str(self_summary["total_spending"])) == Decimal("120.00")
+
+    shared_list = (await client.get("/expenses")).json()
+    assert len(shared_list) == 1
+    assert shared_list[0]["description"] == "Lunch"
 
 
 @pytest.mark.asyncio

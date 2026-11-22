@@ -10,6 +10,7 @@ from app.config import settings
 from app.database import init_db
 from app.routers.expenses import router as expenses_router
 from app.routers.groups import router as groups_router
+from app.routers.self_expenses import router as self_expenses_router
 from app.routers.settlements import router as settlements_router
 from app.routers.staging import router as staging_router
 from app.routers.voice import router as voice_router
@@ -53,9 +54,10 @@ async def health_check() -> dict[str, str]:
     }
 
 
-# Include routers directly (e.g. /voice, /expenses, /settlements, /groups, /balances, /friends, /login)
+# Include routers directly (e.g. /voice, /expenses/self, /expenses, /settlements, /groups, /balances, /friends, /login)
 app.include_router(voice_router)
 app.include_router(settlements_router)
+app.include_router(self_expenses_router)
 app.include_router(expenses_router)
 app.include_router(groups_router)
 app.include_router(staging_router)
@@ -64,6 +66,7 @@ app.include_router(web_login_router)
 # Also mount under API v1 prefix (e.g. /api/v1/voice, /api/v1/settlements, ...)
 app.include_router(voice_router, prefix=settings.API_V1_PREFIX)
 app.include_router(settlements_router, prefix=settings.API_V1_PREFIX)
+app.include_router(self_expenses_router, prefix=settings.API_V1_PREFIX)
 app.include_router(expenses_router, prefix=settings.API_V1_PREFIX)
 app.include_router(groups_router, prefix=settings.API_V1_PREFIX)
 app.include_router(staging_router, prefix=settings.API_V1_PREFIX)

@@ -82,6 +82,32 @@ class SelfExpenseCreate(BaseModel):
     expense_date: datetime | None = None
 
 
+class SelfExpenseUpdate(BaseModel):
+    """Payload to update a solo / self expense."""
+
+    description: str | None = Field(default=None, max_length=255)
+    amount: Decimal | None = Field(default=None, gt=Decimal("0.00"))
+    category: str | None = Field(default=None, max_length=100)
+    expense_date: datetime | None = None
+
+
+class SelfExpenseRead(BaseModel):
+    """Solo / self expense response item."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    description: str
+    amount: Decimal
+    currency: str
+    category: str | None = "general"
+    expense_date: datetime
+    is_deleted: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class SelfCategoryStat(BaseModel):
     """Aggregated spending in a single category for Self tab."""
 
@@ -104,7 +130,7 @@ class SelfExpensesSummary(BaseModel):
     total_count: int = Field(default=0, description="Total number of solo expenses.")
     currency: str = Field(default="INR", max_length=10)
     categories: list[SelfCategoryStat] = Field(default_factory=list)
-    expenses: list[ExpenseRead] = Field(default_factory=list)
+    expenses: list[SelfExpenseRead] = Field(default_factory=list)
 
 
 class GroupCreate(BaseModel):

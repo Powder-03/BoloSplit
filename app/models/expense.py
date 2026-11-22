@@ -79,3 +79,37 @@ class ExpenseSplit(SQLModel, table=True):
 
     # Relationships
     expense: Expense | None = Relationship(back_populates="splits")
+
+
+class SelfExpense(SQLModel, table=True):
+    """Personal / solo expense entry (strictly separated from shared split expenses)."""
+
+    __tablename__ = "self_expenses"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
+    user_id: uuid.UUID = Field(foreign_key="users.id", index=True, nullable=False)
+    description: str = Field(max_length=255, index=True)
+    amount: Decimal = Field(
+        sa_column=Column(Numeric(12, 2), nullable=False),
+        description="Total solo expense amount in Decimal with exact paise precision.",
+    )
+    currency: str = Field(default="INR", max_length=10)
+    category: str | None = Field(default="general", max_length=100, index=True)
+    expense_date: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        nullable=False,
+        index=True,
+    )
+    is_deleted: bool = Field(
+        default=False,
+        index=True,
+        description="Soft delete flag for personal expense audits.",
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        nullable=False,
+    )

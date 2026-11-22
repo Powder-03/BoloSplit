@@ -18,6 +18,13 @@ class IntentType(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ExpenseScope(StrEnum):
+    """Explicit separation between personal (SELF) and friend/group (SHARED) expenses."""
+
+    SELF = "SELF"
+    SHARED = "SHARED"
+
+
 class SplitTypeHint(StrEnum):
     """Split method classification."""
 
@@ -47,6 +54,10 @@ class ExtractedItem(BaseModel):
         description="Numeric total normalized to INR (e.g., 'dedh hazar' -> 1500.0, '350' -> 350.0).",
     )
     currency: str = Field(default="INR", description="Currency ISO code.")
+    scope: ExpenseScope = Field(
+        default=ExpenseScope.SHARED,
+        description="SELF for strictly personal expenses (no friends/groups); SHARED for friends or groups.",
+    )
     payer_raw: str | None = Field(
         default=None,
         description="Spoken payer expression (e.g. 'me', 'mine', 'Sahaj', 'Rohit').",

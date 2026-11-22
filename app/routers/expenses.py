@@ -17,15 +17,10 @@ from app.schemas.ledger import (
     ExpenseCreate,
     ExpenseRead,
     ExpenseUpdate,
-    SelfExpenseCreate,
-    SelfExpensesSummary,
 )
-from app.services.ledger_service import (
-    calculate_equal_splits,
-    get_self_expenses_summary,
-)
+from app.services.ledger_service import calculate_equal_splits
 
-router = APIRouter(prefix="/expenses", tags=["Verified Expenses Ledger"])
+router = APIRouter(prefix="/expenses", tags=["Shared Expenses Ledger"])
 
 
 async def _attach_payer_names(expenses: list[Expense], session: AsyncSession) -> list[ExpenseRead]:
@@ -95,20 +90,23 @@ async def _user_can_access_expense(
 @router.get(
     "",
     response_model=list[ExpenseRead],
-    summary="List verified expenses from main ledger",
+    summary="List shared expenses from the verified ledger",
 )
 async def list_expenses(
     group_id: uuid.UUID | None = Query(None, description="Filter by group ID"),
     scope: str | None = Query(
         None,
-        description="Filter scope: 'self' (solo only), 'shared' (friends & groups), or 'all' (default)",
+        description="Deprecated filter ('shared' / 'all' return shared expenses; use /expenses/self for personal expenses).",
     ),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[ExpenseRead]:
-    """Retrieve verified active expenses involving the active user, newest first."""
+    """Retrieve verified active shared expenses involving the active user, newest first."""
+    if scope == "self":
+        return []
+
     other_split_subquery = select(ExpenseSplit.id).where(
         ExpenseSplit.expense_id == Expense.id,
         ExpenseSplit.user_id != current_user.id,
@@ -119,102 +117,21 @@ async def list_expenses(
         .where(
             Expense.is_deleted.is_(False),
             _user_accessible_expense_clause(current_user.id),
+            or_(
+                Expense.group_id.is_not(None),
+                Expense.payer_id != current_user.id,
+                other_split_subquery.exists(),
+            ),
         )
         .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
     )
     if group_id:
         query = query.where(Expense.group_id == group_id)
 
-    if scope == "self":
-        query = query.where(
-            Expense.group_id.is_(None),
-            Expense.payer_id == current_user.id,
-            ~other_split_subquery.exists(),
-        )
-    elif scope == "shared":
-        query = query.where(
-            or_(
-                Expense.group_id.is_not(None),
-                Expense.payer_id != current_user.id,
-                other_split_subquery.exists(),
-            )
-        )
-
     query = query.offset(offset).limit(limit)
     result = await session.execute(query)
     expenses = result.scalars().all()
     return await _attach_payer_names(expenses, session)
-
-
-@router.post(
-    "/self",
-    response_model=ExpenseRead,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a strictly solo / personal expense for self",
-)
-async def create_self_expense(
-    payload: SelfExpenseCreate,
-    current_user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
-) -> ExpenseRead:
-    """Create a 100% solo personal expense allocated entirely to the active user."""
-    expense = Expense(
-        group_id=None,
-        description=payload.description,
-        amount=payload.amount,
-        currency=payload.currency,
-        payer_id=current_user.id,
-        category=payload.category or "general",
-        expense_date=payload.expense_date or datetime.now(UTC),
-        is_deleted=False,
-    )
-    session.add(expense)
-    await session.flush()
-
-    split = ExpenseSplit(
-        expense_id=expense.id,
-        user_id=current_user.id,
-        owed_amount=payload.amount,
-        split_type="EQUAL",
-    )
-    session.add(split)
-    await session.commit()
-
-    fetch_query = (
-        select(Expense)
-        .options(selectinload(Expense.splits))
-        .where(Expense.id == expense.id)
-    )
-    saved = (await session.execute(fetch_query)).scalars().first()
-    res = ExpenseRead.model_validate(saved)
-    res.payer_name = current_user.name
-    return res
-
-
-@router.get(
-    "/self",
-    response_model=SelfExpensesSummary,
-    summary="Get strictly solo expenses, monthly spending & category breakdown for self",
-)
-async def get_self_expenses(
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    category: str | None = Query(None, description="Filter by category (e.g. 'fuel', 'food')"),
-    month: int | None = Query(None, ge=1, le=12, description="Filter by calendar month (1-12)"),
-    year: int | None = Query(None, ge=2000, le=2100, description="Filter by calendar year"),
-    current_user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
-) -> SelfExpensesSummary:
-    """Retrieve personal ledger summary, monthly spend, category breakdown and solo transactions."""
-    return await get_self_expenses_summary(
-        session=session,
-        user=current_user,
-        limit=limit,
-        offset=offset,
-        category=category,
-        month=month,
-        year=year,
-    )
 
 
 @router.post(

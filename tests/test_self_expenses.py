@@ -90,15 +90,30 @@ async def test_create_and_get_self_expenses(client_with_user):
     )
     assert post_res.status_code == 201
     created_solo = post_res.json()
+    solo_id = created_solo["id"]
     assert created_solo["description"] == "Petrol"
     assert Decimal(str(created_solo["amount"])) == Decimal("500.00")
     assert created_solo["category"] == "fuel"
-    assert created_solo["group_id"] is None
-    assert created_solo["payer_id"] == str(caller.id)
-    assert created_solo["payer_name"] == caller.name
-    assert len(created_solo["splits"]) == 1
-    assert created_solo["splits"][0]["user_id"] == str(caller.id)
-    assert Decimal(str(created_solo["splits"][0]["owed_amount"])) == Decimal("500.00")
+    assert created_solo["user_id"] == str(caller.id)
+
+    # Verify GET / PATCH / DELETE on /expenses/self/{id}
+    detail_res = await client.get(f"/expenses/self/{solo_id}")
+    assert detail_res.status_code == 200
+    assert detail_res.json()["description"] == "Petrol"
+
+    patch_res = await client.patch(
+        f"/expenses/self/{solo_id}",
+        json={"description": "Petrol Bunk", "amount": "550.00"},
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["description"] == "Petrol Bunk"
+    assert Decimal(str(patch_res.json()["amount"])) == Decimal("550.00")
+
+    # Restore amount to 500.00 for summary assertion below
+    await client.patch(
+        f"/expenses/self/{solo_id}",
+        json={"description": "Petrol", "amount": "500.00"},
+    )
 
     # 3. Add more solo expenses in different categories
     res2 = await client.post(
@@ -166,29 +181,38 @@ async def test_create_and_get_self_expenses(client_with_user):
     assert len(fuel_data["expenses"]) == 2
     assert all(e["category"] == "fuel" for e in fuel_data["expenses"])
 
-    # 7. Test scope filtering on GET /expenses
+    # 7. Verify shared /expenses does NOT include solo expenses
     scope_self_res = await client.get("/expenses?scope=self")
     assert scope_self_res.status_code == 200
-    assert len(scope_self_res.json()) == 4
+    assert scope_self_res.json() == []
 
     scope_shared_res = await client.get("/expenses?scope=shared")
     assert scope_shared_res.status_code == 200
     assert len(scope_shared_res.json()) == 1
     assert scope_shared_res.json()[0]["description"] == "Shared Dinner with Rohan"
 
-    scope_all_res = await client.get("/expenses?scope=all")
+    scope_all_res = await client.get("/expenses")
     assert scope_all_res.status_code == 200
-    assert len(scope_all_res.json()) == 5
+    assert len(scope_all_res.json()) == 1
+    assert scope_all_res.json()[0]["description"] == "Shared Dinner with Rohan"
 
-    # 8. Verify /balances is NOT affected by solo expenses
+    # 8. Delete one solo expense via DELETE /expenses/self/{id}
+    del_res = await client.delete(f"/expenses/self/{solo_id}")
+    assert del_res.status_code == 204
+    assert (await client.get(f"/expenses/self/{solo_id}")).status_code == 404
+    after_del = (await client.get("/expenses/self")).json()
+    assert after_del["total_count"] == 3
+    assert Decimal(str(after_del["total_spending"])) == Decimal("2500.00")
+
+    # 9. Verify /balances is NOT affected by solo expenses
     bal_res = await client.get("/balances")
     assert bal_res.status_code == 200
     bal_data = bal_res.json()
-    # Rohan owes caller 600 from shared dinner; solo 3000 has 0 effect on balances
+    # Rohan owes caller 600 from shared dinner; solo 2500 has 0 effect on balances
     assert Decimal(str(bal_data["total_owed_to_you"])) == Decimal("600.00")
     assert Decimal(str(bal_data["net_total"])) == Decimal("600.00")
 
-    # 9. Test prefix route /api/v1/expenses/self
+    # 10. Test prefix route /api/v1/expenses/self
     v1_res = await client.get("/api/v1/expenses/self")
     assert v1_res.status_code == 200
-    assert Decimal(str(v1_res.json()["total_spending"])) == Decimal("3000.00")
+    assert Decimal(str(v1_res.json()["total_spending"])) == Decimal("2500.00")

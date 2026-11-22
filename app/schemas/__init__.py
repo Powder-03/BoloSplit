@@ -2,6 +2,7 @@
 
 from app.schemas.ai import (
     CandidateSearchQuery,
+    ExpenseScope,
     ExtractedItem,
     IntentType,
     ResolvedSplit,
@@ -22,7 +23,9 @@ from app.schemas.ledger import (
     GroupRead,
     SelfCategoryStat,
     SelfExpenseCreate,
+    SelfExpenseRead,
     SelfExpensesSummary,
+    SelfExpenseUpdate,
     UserBalance,
 )
 from app.schemas.staging import (
@@ -35,6 +38,7 @@ from app.schemas.voice import VoiceCommandRequest, VoiceIngestResponse
 
 __all__ = [
     "IntentType",
+    "ExpenseScope",
     "SplitTypeHint",
     "ExtractedItem",
     "StageOneOutput",
@@ -59,6 +63,8 @@ __all__ = [
     "BalanceSummary",
     "UserBalance",
     "SelfExpenseCreate",
+    "SelfExpenseRead",
+    "SelfExpenseUpdate",
     "SelfCategoryStat",
     "SelfExpensesSummary",
 ]

@@ -291,7 +291,7 @@ async def test_direct_voice_splitwise_flow(test_client: AsyncClient, test_db_ses
 
 @pytest.mark.asyncio
 async def test_direct_voice_personal_expense(test_client: AsyncClient):
-    """Verify that when no friends are named, expense is saved directly to self."""
+    """Verify that when no friends are named, expense is saved directly to self_expenses."""
     mock_stage1_self = StageOneOutput(
         intent=IntentType.CREATE,
         is_complex=False,
@@ -300,6 +300,7 @@ async def test_direct_voice_personal_expense(test_client: AsyncClient):
                 description="Cold Coffee",
                 amount=180.0,
                 currency="INR",
+                scope="SELF",
                 payer_raw="me",
                 participants_raw=["me"],
                 category="food",
@@ -323,5 +324,11 @@ async def test_direct_voice_personal_expense(test_client: AsyncClient):
     assert voice_resp.status_code == 200
     res = voice_resp.json()
     assert res["status"] == "SUCCESS"
-    assert len(res["expenses"]) == 1
-    assert Decimal(str(res["expenses"][0]["amount"])) == Decimal("180.00")
+    assert res["expenses"] == []
+    assert len(res["self_expenses"]) == 1
+    assert Decimal(str(res["self_expenses"][0]["amount"])) == Decimal("180.00")
+
+    # Verify it appears in /expenses/self and NOT in shared /expenses
+    self_res = (await test_client.get("/expenses/self")).json()
+    assert self_res["total_count"] == 1
+    assert (await test_client.get("/expenses")).json() == []

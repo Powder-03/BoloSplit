@@ -1,6 +1,6 @@
 """Models package exports."""
 
-from app.models.expense import Expense, ExpenseSplit
+from app.models.expense import Expense, ExpenseSplit, SelfExpense
 from app.models.group import Group, GroupMember
 from app.models.settlement import Settlement
 from app.models.staging import StagedExpense
@@ -13,6 +13,7 @@ __all__ = [
     "GroupMember",
     "Expense",
     "ExpenseSplit",
+    "SelfExpense",
     "Settlement",
     "StagedExpense",
 ]

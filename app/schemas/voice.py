@@ -4,7 +4,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from app.schemas.ledger import BalanceSummary, ExpenseRead
+from app.schemas.ledger import BalanceSummary, ExpenseRead, SelfExpenseRead
 from app.schemas.settlement import SettlementRead
 from app.schemas.staging import StagedExpenseRead
 
@@ -40,7 +40,11 @@ class VoiceIngestResponse(BaseModel):
     count: int = Field(default=1, description="Number of items created or modified.")
     expenses: list[ExpenseRead] = Field(
         default_factory=list,
-        description="Created or updated verified ledger expenses.",
+        description="Created or updated shared ledger expenses.",
+    )
+    self_expenses: list[SelfExpenseRead] = Field(
+        default_factory=list,
+        description="Created or updated personal (self) expenses.",
     )
     settlement: SettlementRead | None = Field(
         default=None,

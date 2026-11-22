@@ -39,7 +39,7 @@ async_session_maker = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """Initialize database extensions and create tables."""
+    """Initialize database extensions, create tables, and migrate legacy solo expenses."""
     async with engine.begin() as conn:
         # Enable pg_trgm extension if using PostgreSQL (if permissions permit)
         dialect = conn.dialect.name
@@ -50,6 +50,41 @@ async def init_db() -> None:
                 pass
         # Create all tables registered with SQLModel metadata
         await conn.run_sync(SQLModel.metadata.create_all)
+
+        # Idempotent one-time migration: move legacy solo rows from `expenses` -> `self_expenses`
+        await conn.execute(
+            text(
+                """
+                INSERT INTO self_expenses (
+                    id, user_id, description, amount, currency, category,
+                    expense_date, is_deleted, created_at, updated_at
+                )
+                SELECT
+                    e.id, e.payer_id, e.description, e.amount, e.currency, e.category,
+                    e.expense_date, e.is_deleted, e.created_at, e.updated_at
+                FROM expenses e
+                WHERE e.is_deleted = FALSE
+                  AND e.group_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM expense_splits s
+                      WHERE s.expense_id = e.id AND s.user_id != e.payer_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM self_expenses se WHERE se.id = e.id
+                  )
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                UPDATE expenses
+                SET is_deleted = TRUE
+                WHERE is_deleted = FALSE
+                  AND id IN (SELECT id FROM self_expenses)
+                """
+            )
+        )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

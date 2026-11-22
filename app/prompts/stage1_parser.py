@@ -42,13 +42,11 @@ Always format `expense_date_iso` as 'YYYY-MM-DD' or ISO 8601 string.
   * Always mark `is_complex = True` for percentage splits or group actions.
 
 ### STRICT PARTICIPANT & SELF-EXPENSE RULE
-Unless the user EXPLICITLY names a friend (e.g., 'split with Sahaj', 'Rohit ke saath', 'on Rishabh') or specifies a group:
-- ONLY treat the expense as 100% for SELF (personal expense) when the utterance is clearly a personal expense (e.g. "add 180 for cold coffee", "petrol 500").
-- Set `payer_raw = "me"`.
-- Set `participants_raw = ["me"]`.
-- Set `split_type = EQUAL`.
-- Set `is_complex = False`.
-- IMPORTANT: If the user mentions ANY person name (even if not found in `Known Friends & Directory`), NEVER drop that name or replace it with `"me"`. Always extract the spoken name into `participants_raw` so backend validation can reject unknown names safely.
+Set `scope` explicitly on every `ExtractedItem`:
+- `scope = "SELF"` ONLY when the utterance is clearly a personal expense with NO friend or group mentioned (e.g., "add 180 for cold coffee", "petrol 500"):
+  * Set `payer_raw = "me"`, `participants_raw = ["me"]`, `split_type = EQUAL`.
+- `scope = "SHARED"` whenever the user names ANY friend (e.g., "split with Sahaj", "on Rishabh") or mentions a group (`group_raw`):
+  * IMPORTANT: If the user mentions ANY person name (even if not found in `Known Friends & Directory`), NEVER drop that name or set `scope = "SELF"`. Always set `scope = "SHARED"` and extract the spoken name into `participants_raw` so backend validation can verify or reject unknown names safely.
 
 ### CONFIDENCE & RELIABILITY RULES (CRITICAL FOR FINANCE)
 - Set `confidence = "HIGH"` ONLY when:
@@ -71,17 +69,8 @@ Unless the user EXPLICITLY names a friend (e.g., 'split with Sahaj', 'Rohit ke s
   * Set `payer_raw = "me"` and `participants_raw = ["me", "rishabh"]`.
 
 ### COMPLEXITY HEURISTICS (`is_complex`)
-Mark `is_complex = True` IF:
-1. Intent is `UPDATE`, `DELETE`, or `SETTLE`.
-2. Group is mentioned (`group_raw` is present).
-3. Unequal or percentage splits (`split_type == PERCENTAGE`).
-4. Temporal reference is in the past ("yesterday", "parso", "last night", specific dates).
-
-Mark `is_complex = False` (FAST PATH) ONLY IF:
-- Intent is `CREATE` or `MULTI_CREATE`.
-- Group is NOT mentioned (direct friend or self).
-- Date is current (today / now).
-- Split is EQUAL.
+- Mark `is_complex = True` ONLY IF intent is `UPDATE` or `DELETE` (requires searching existing records).
+- Mark `is_complex = False` for `CREATE`, `MULTI_CREATE`, `SETTLE`, and `GET` (including groups, past dates, and percentage splits — backend handles them directly!).
 
 ### OUTPUT FORMAT
 Always output strictly conforming to the `StageOneOutput` schema.

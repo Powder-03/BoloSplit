@@ -9,13 +9,13 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.expense import Expense, ExpenseSplit
+from app.models.expense import Expense, SelfExpense
 from app.models.settlement import Settlement
 from app.models.user import Friendship, User
 from app.schemas.ledger import (
     BalanceSummary,
-    ExpenseRead,
     SelfCategoryStat,
+    SelfExpenseRead,
     SelfExpensesSummary,
     UserBalance,
 )
@@ -260,24 +260,16 @@ async def get_self_expenses_summary(
     year: int | None = None,
 ) -> SelfExpensesSummary:
     """
-    Compute strictly solo / personal spending summary and paginated expenses for user.
-
-    Excludes all group expenses and expenses with shared participant splits.
+    Compute strictly solo / personal spending summary and paginated expenses for user
+    from the dedicated `self_expenses` table.
     """
-    other_split_subquery = select(ExpenseSplit.id).where(
-        ExpenseSplit.expense_id == Expense.id,
-        ExpenseSplit.user_id != user.id,
-    )
     base_query = (
-        select(Expense)
-        .options(selectinload(Expense.splits))
+        select(SelfExpense)
         .where(
-            Expense.is_deleted.is_(False),
-            Expense.group_id.is_(None),
-            Expense.payer_id == user.id,
-            ~other_split_subquery.exists(),
+            SelfExpense.is_deleted.is_(False),
+            SelfExpense.user_id == user.id,
         )
-        .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
+        .order_by(SelfExpense.expense_date.desc(), SelfExpense.created_at.desc())
     )
 
     result = await session.execute(base_query)
@@ -356,11 +348,7 @@ async def get_self_expenses_summary(
     total_count = len(filtered_expenses)
     paginated = filtered_expenses[offset : offset + limit]
 
-    expense_reads: list[ExpenseRead] = []
-    for e in paginated:
-        read_item = ExpenseRead.model_validate(e)
-        read_item.payer_name = user.name
-        expense_reads.append(read_item)
+    expense_reads = [SelfExpenseRead.model_validate(e) for e in paginated]
 
     return SelfExpensesSummary(
         total_spending=total_spending,
