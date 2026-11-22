@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user
 from app.database import get_session
 from app.models.expense import Expense, ExpenseSplit
+from app.models.group import GroupMember
 from app.models.user import User
 from app.schemas.ledger import (
     ExpenseCreate,
@@ -44,6 +45,53 @@ async def _attach_payer_names(expenses: list[Expense], session: AsyncSession) ->
     return reads
 
 
+def _user_accessible_expense_clause(user_id: uuid.UUID):
+    """SQLAlchemy filter restricting expenses to those the user paid, shares, or belongs to via group."""
+    caller_split_subquery = select(ExpenseSplit.id).where(
+        ExpenseSplit.expense_id == Expense.id,
+        ExpenseSplit.user_id == user_id,
+    )
+    caller_group_subquery = select(GroupMember.id).where(
+        GroupMember.group_id == Expense.group_id,
+        GroupMember.user_id == user_id,
+    )
+    return or_(
+        Expense.payer_id == user_id,
+        caller_split_subquery.exists(),
+        caller_group_subquery.exists(),
+    )
+
+
+async def _user_can_access_expense(
+    session: AsyncSession, expense: Expense, user_id: uuid.UUID
+) -> bool:
+    """Verify whether user_id is payer, split participant, or group member of expense."""
+    if expense.payer_id == user_id:
+        return True
+    split_match = (
+        await session.execute(
+            select(ExpenseSplit.id).where(
+                ExpenseSplit.expense_id == expense.id,
+                ExpenseSplit.user_id == user_id,
+            )
+        )
+    ).scalars().first()
+    if split_match:
+        return True
+    if expense.group_id is not None:
+        mem_match = (
+            await session.execute(
+                select(GroupMember.id).where(
+                    GroupMember.group_id == expense.group_id,
+                    GroupMember.user_id == user_id,
+                )
+            )
+        ).scalars().first()
+        if mem_match:
+            return True
+    return False
+
+
 @router.get(
     "",
     response_model=list[ExpenseRead],
@@ -60,7 +108,7 @@ async def list_expenses(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[ExpenseRead]:
-    """Retrieve verified active expenses with splits, newest first."""
+    """Retrieve verified active expenses involving the active user, newest first."""
     other_split_subquery = select(ExpenseSplit.id).where(
         ExpenseSplit.expense_id == Expense.id,
         ExpenseSplit.user_id != current_user.id,
@@ -68,8 +116,11 @@ async def list_expenses(
     query = (
         select(Expense)
         .options(selectinload(Expense.splits))
-        .where(Expense.is_deleted.is_(False))
-        .order_by(Expense.expense_date.desc())
+        .where(
+            Expense.is_deleted.is_(False),
+            _user_accessible_expense_clause(current_user.id),
+        )
+        .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
     )
     if group_id:
         query = query.where(Expense.group_id == group_id)
@@ -84,6 +135,7 @@ async def list_expenses(
         query = query.where(
             or_(
                 Expense.group_id.is_not(None),
+                Expense.payer_id != current_user.id,
                 other_split_subquery.exists(),
             )
         )
@@ -263,6 +315,11 @@ async def get_expense_detail(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Expense not found.",
         )
+    if not await _user_can_access_expense(session, expense, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this expense.",
+        )
     payer_user = (await session.execute(select(User).where(User.id == expense.payer_id))).scalars().first()
     res = ExpenseRead.model_validate(expense)
     if payer_user:
@@ -290,6 +347,11 @@ async def update_expense(
     expense = (await session.execute(query)).scalars().first()
     if not expense:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found.")
+    if not await _user_can_access_expense(session, expense, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this expense.",
+        )
 
     if payload.description is not None:
         expense.description = payload.description
@@ -335,6 +397,11 @@ async def delete_expense(
     expense = (await session.execute(query)).scalars().first()
     if not expense:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found.")
+    if not await _user_can_access_expense(session, expense, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to delete this expense.",
+        )
 
     expense.is_deleted = True
     expense.updated_at = datetime.now(UTC)

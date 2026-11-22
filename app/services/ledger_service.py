@@ -277,7 +277,7 @@ async def get_self_expenses_summary(
             Expense.payer_id == user.id,
             ~other_split_subquery.exists(),
         )
-        .order_by(Expense.expense_date.desc())
+        .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
     )
 
     result = await session.execute(base_query)

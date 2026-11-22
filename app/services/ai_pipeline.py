@@ -4,7 +4,7 @@ import json
 import re
 import uuid
 import zoneinfo
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -33,6 +33,68 @@ from app.services.ledger_service import (
 
 # IST Timezone (+05:30)
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+
+
+def resolve_expense_date(expense_date_iso: str | None) -> datetime:
+    """
+    Parse AI-extracted expense_date_iso into a timezone-aware UTC datetime.
+
+    - Date-only strings ('YYYY-MM-DD') for today (IST) resolve to the current
+      timestamp so multiple expenses added today keep their chronological order.
+    - Date-only strings for past/future dates anchor at 12:00 IST (06:30 UTC)
+      so calendar dates never shift across UTC/local timezone boundaries.
+    - Full ISO timestamps preserve their time (defaulting naive ones to IST).
+    """
+    now_utc = datetime.now(UTC)
+    if not expense_date_iso or not expense_date_iso.strip():
+        return now_utc
+
+    raw = expense_date_iso.strip()
+    now_ist = now_utc.astimezone(IST)
+
+    if len(raw) == 10 and "T" not in raw and " " not in raw:
+        try:
+            parsed_date = date.fromisoformat(raw)
+        except ValueError:
+            return now_utc
+        if parsed_date == now_ist.date():
+            return now_utc
+        return datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            12,
+            0,
+            0,
+            tzinfo=IST,
+        ).astimezone(UTC)
+
+    try:
+        parsed_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return now_utc
+
+    if parsed_dt.tzinfo is None:
+        if (
+            parsed_dt.hour == 0
+            and parsed_dt.minute == 0
+            and parsed_dt.second == 0
+            and parsed_dt.microsecond == 0
+        ):
+            if parsed_dt.date() == now_ist.date():
+                return now_utc
+            return datetime(
+                parsed_dt.year,
+                parsed_dt.month,
+                parsed_dt.day,
+                12,
+                0,
+                0,
+                tzinfo=IST,
+            ).astimezone(UTC)
+        parsed_dt = parsed_dt.replace(tzinfo=IST)
+
+    return parsed_dt.astimezone(UTC)
 
 
 def get_genai_client() -> genai.Client:
@@ -582,13 +644,7 @@ User Voice Utterance:
                         action_type="CREATE",
                     )
 
-            item_date = datetime.now(UTC)
-            if item.expense_date_iso:
-                try:
-                    parsed_d = datetime.fromisoformat(item.expense_date_iso)
-                    item_date = parsed_d.replace(tzinfo=UTC)
-                except ValueError:
-                    pass
+            item_date = resolve_expense_date(item.expense_date_iso)
 
             prepared_items.append((item, resolved_gid, p_ids, amt_decimal, item_date))
 
@@ -996,7 +1052,7 @@ User Voice Utterance:
             currency=stage2_output.currency or "INR",
             payer_id=payer_id,
             category=stage2_output.category or "general",
-            expense_date=datetime.now(UTC),
+            expense_date=resolve_expense_date(first_item.expense_date_iso if first_item else None),
             is_deleted=False,
         )
         session.add(expense)

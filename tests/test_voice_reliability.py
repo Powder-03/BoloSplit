@@ -403,3 +403,95 @@ async def test_stage2_medium_confidence_is_blocked(client_with_user):
 
     expenses = (await session.execute(select(Expense))).scalars().all()
     assert expenses == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_expense_date_anchors_today_and_past_dates():
+    from datetime import UTC, datetime, timedelta
+
+    from app.services.ai_pipeline import IST, resolve_expense_date
+
+    today_ist = datetime.now(IST).date()
+    resolved_today = resolve_expense_date(today_ist.isoformat())
+    assert resolved_today.astimezone(IST).date() == today_ist
+    # Must preserve real current time instead of pinning to 00:00 UTC (5:30 AM IST)
+    assert abs((datetime.now(UTC) - resolved_today).total_seconds()) < 10
+
+    past_date = today_ist - timedelta(days=2)
+    resolved_past = resolve_expense_date(past_date.isoformat())
+    assert resolved_past.astimezone(IST).date() == past_date
+    assert resolved_past.astimezone(IST).hour == 12
+    assert resolved_past.astimezone(IST).minute == 0
+
+
+@pytest.mark.asyncio
+async def test_on_friend_expense_excluded_from_self_and_isolated_across_users(test_db_session):
+    user_a = User(id=uuid.uuid4(), email="usera@example.com", name="User A", phone="+919000010001")
+    user_c = User(id=uuid.uuid4(), email="userc@example.com", name="User C", phone="+919000010003")
+    test_db_session.add(user_a)
+    test_db_session.add(user_c)
+    await test_db_session.commit()
+    await test_db_session.refresh(user_a)
+    await test_db_session.refresh(user_c)
+
+    active_user = {"user": user_a}
+
+    async def override_get_session():
+        yield test_db_session
+
+    async def override_get_current_user():
+        return active_user["user"]
+
+    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_current_user] = override_get_current_user
+
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            f_res = await c.post(
+                "/friends",
+                json={"friend_phone": "+919800000099", "friend_name": "Rishabh", "nickname": "Rishabh"},
+            )
+            assert f_res.status_code == 201
+
+            mock_s1 = StageOneOutput(
+                intent=IntentType.CREATE,
+                confidence="HIGH",
+                is_complex=False,
+                items=[
+                    ExtractedItem(
+                        description="Dinner",
+                        amount=500.0,
+                        payer_raw="me",
+                        participants_raw=["rishabh"],
+                        split_type=SplitTypeHint.EQUAL,
+                    )
+                ],
+                spoken_confirmation="Added ₹500 on Rishabh.",
+            )
+            mock_client = MagicMock()
+            mock_client.aio.models.generate_content = AsyncMock(
+                return_value=MagicMock(text=mock_s1.model_dump_json())
+            )
+            with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+                voice_res = await c.post("/voice/text", json={"text": "add 500 rupees on rishabh"})
+            assert voice_res.status_code == 200
+            exp_id = voice_res.json()["expenses"][0]["id"]
+
+            # User A sees it in /expenses & /expenses?scope=shared, NOT in /expenses/self or scope=self
+            all_a = (await c.get("/expenses")).json()
+            assert [e["id"] for e in all_a] == [exp_id]
+            shared_a = (await c.get("/expenses?scope=shared")).json()
+            assert [e["id"] for e in shared_a] == [exp_id]
+            self_summary_a = (await c.get("/expenses/self")).json()
+            assert self_summary_a["total_count"] == 0
+            assert (await c.get("/expenses?scope=self")).json() == []
+
+            # Unrelated User C must NOT see or mutate User A's expense
+            active_user["user"] = user_c
+            assert (await c.get("/expenses")).json() == []
+            assert (await c.get(f"/expenses/{exp_id}")).status_code == 403
+            assert (await c.patch(f"/expenses/{exp_id}", json={"amount": 100})).status_code == 403
+            assert (await c.delete(f"/expenses/{exp_id}")).status_code == 403
+    finally:
+        app.dependency_overrides.clear()

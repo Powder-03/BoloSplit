@@ -357,7 +357,7 @@ async def get_group_activity_feed(
         select(Expense)
         .options(selectinload(Expense.splits))
         .where(Expense.group_id == group_id, Expense.is_deleted.is_(False))
-        .order_by(Expense.expense_date.desc())
+        .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
         .offset(offset)
         .limit(limit)
     )
@@ -743,7 +743,7 @@ async def get_bilateral_activity_feed(
                 (Expense.payer_id == friend_id),
             ),
         )
-        .order_by(Expense.expense_date.desc())
+        .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
     )
     all_candidate_exps = (await session.execute(exp_query)).scalars().all()
 
