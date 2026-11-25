@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.database import get_session
+from app.models.group import GroupMember
 from app.models.settlement import Settlement
 from app.models.user import User
 from app.schemas.settlement import SettlementCreate, SettlementRead
@@ -27,24 +28,54 @@ async def create_settlement(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> SettlementRead:
-    """Record a debt settlement payment from the active user to a friend."""
-    if payload.payee_id == current_user.id:
+    """Record a debt settlement payment (either paid by active user or received from a friend)."""
+    actual_payer_id = payload.payer_id or current_user.id
+
+    if actual_payer_id == payload.payee_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot settle up with yourself.",
         )
 
-    # Verify payee user exists
-    payee_res = await session.execute(select(User).where(User.id == payload.payee_id))
-    payee = payee_res.scalars().first()
-    if not payee:
+    if current_user.id not in (actual_payer_id, payload.payee_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be either the payer or the payee of the settlement.",
+        )
+
+    if payload.group_id is not None:
+        mem_check = (
+            await session.execute(
+                select(GroupMember.id).where(
+                    GroupMember.group_id == payload.group_id,
+                    GroupMember.user_id == current_user.id,
+                )
+            )
+        ).scalars().first()
+        if not mem_check:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Group not found or you are not a member of this group.",
+            )
+
+    users_res = await session.execute(
+        select(User).where(User.id.in_([actual_payer_id, payload.payee_id]))
+    )
+    users_by_id = {u.id: u for u in users_res.scalars().all()}
+
+    if payload.payee_id not in users_by_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Payee user not found.",
         )
+    if actual_payer_id not in users_by_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payer user not found.",
+        )
 
     settlement = Settlement(
-        payer_id=current_user.id,
+        payer_id=actual_payer_id,
         payee_id=payload.payee_id,
         amount=payload.amount,
         currency=payload.currency,
@@ -62,9 +93,9 @@ async def create_settlement(
     return SettlementRead(
         id=settlement.id,
         payer_id=settlement.payer_id,
-        payer_name=current_user.name,
+        payer_name=users_by_id[actual_payer_id].name,
         payee_id=settlement.payee_id,
-        payee_name=payee.name,
+        payee_name=users_by_id[payload.payee_id].name,
         amount=settlement.amount,
         currency=settlement.currency,
         group_id=settlement.group_id,
@@ -114,7 +145,6 @@ async def list_settlements(
     result = await session.execute(query)
     settlements = result.scalars().all()
 
-    # Pre-fetch user names
     user_ids = {s.payer_id for s in settlements} | {s.payee_id for s in settlements}
     names: dict[uuid.UUID, str] = {}
     if user_ids:

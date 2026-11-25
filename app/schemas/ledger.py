@@ -33,8 +33,8 @@ class ExpenseSplitRead(BaseModel):
 class ExpenseCreate(BaseModel):
     """Manual fallback creation payload for an expense."""
 
-    description: str
-    amount: Decimal
+    description: str = Field(..., min_length=1, max_length=255)
+    amount: Decimal = Field(..., gt=Decimal("0.00"))
     currency: str = "INR"
     payer_id: uuid.UUID
     group_id: uuid.UUID | None = None
@@ -46,8 +46,8 @@ class ExpenseCreate(BaseModel):
 class ExpenseUpdate(BaseModel):
     """Payload to update an expense."""
 
-    description: str | None = None
-    amount: Decimal | None = None
+    description: str | None = Field(default=None, min_length=1, max_length=255)
+    amount: Decimal | None = Field(default=None, gt=Decimal("0.00"))
     category: str | None = None
     expense_date: datetime | None = None
 

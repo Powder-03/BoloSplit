@@ -1,12 +1,12 @@
 """Schemas for voice command ingestion (Direct-to-Ledger)."""
 
 import uuid
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 from app.schemas.ledger import BalanceSummary, ExpenseRead, SelfExpenseRead
 from app.schemas.settlement import SettlementRead
-from app.schemas.staging import StagedExpenseRead
 
 
 class VoiceCommandRequest(BaseModel):
@@ -70,7 +70,7 @@ class VoiceIngestResponse(BaseModel):
         default=None,
         description="Machine-readable error code when status is ERROR or AMBIGUOUS.",
     )
-    staged_items: list[StagedExpenseRead] = Field(
+    staged_items: list[dict[str, Any]] = Field(
         default_factory=list,
-        description="Backward-compatible field for staged queue (if enabled).",
+        description="Backward-compatible empty list for legacy clients.",
     )

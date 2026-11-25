@@ -1,4 +1,4 @@
-"""Strictly solo / personal expense CRUD endpoints (`/expenses/self`)."""
+"""Strictly solo / personal expense CRUD endpoints (`/expenses/self`), backed by unified `Expense(is_personal=True)`."""
 
 import uuid
 from datetime import UTC, datetime
@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.database import get_session
-from app.models.expense import SelfExpense
+from app.models.expense import Expense
 from app.models.user import User
 from app.schemas.ledger import (
     SelfExpenseCreate,
@@ -59,14 +59,15 @@ async def create_self_expense(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> SelfExpenseRead:
-    """Create a 100% solo personal expense in the dedicated `self_expenses` table."""
-    expense = SelfExpense(
-        user_id=current_user.id,
+    """Create a 100% solo personal expense (`is_personal=True`)."""
+    expense = Expense(
+        payer_id=current_user.id,
         description=payload.description.strip(),
         amount=payload.amount,
         currency=payload.currency,
         category=payload.category or "general",
         expense_date=payload.expense_date or datetime.now(UTC),
+        is_personal=True,
         is_deleted=False,
     )
     session.add(expense)
@@ -88,10 +89,11 @@ async def get_self_expense_detail(
     """Fetch a single solo expense owned by the active user."""
     expense = (
         await session.execute(
-            select(SelfExpense).where(
-                SelfExpense.id == expense_id,
-                SelfExpense.user_id == current_user.id,
-                SelfExpense.is_deleted.is_(False),
+            select(Expense).where(
+                Expense.id == expense_id,
+                Expense.payer_id == current_user.id,
+                Expense.is_personal.is_(True),
+                Expense.is_deleted.is_(False),
             )
         )
     ).scalars().first()
@@ -114,10 +116,11 @@ async def update_self_expense(
     """Update description, amount, category, or date on a solo expense."""
     expense = (
         await session.execute(
-            select(SelfExpense).where(
-                SelfExpense.id == expense_id,
-                SelfExpense.user_id == current_user.id,
-                SelfExpense.is_deleted.is_(False),
+            select(Expense).where(
+                Expense.id == expense_id,
+                Expense.payer_id == current_user.id,
+                Expense.is_personal.is_(True),
+                Expense.is_deleted.is_(False),
             )
         )
     ).scalars().first()
@@ -159,10 +162,11 @@ async def delete_self_expense(
     """Soft-delete a solo expense owned by the active user."""
     expense = (
         await session.execute(
-            select(SelfExpense).where(
-                SelfExpense.id == expense_id,
-                SelfExpense.user_id == current_user.id,
-                SelfExpense.is_deleted.is_(False),
+            select(Expense).where(
+                Expense.id == expense_id,
+                Expense.payer_id == current_user.id,
+                Expense.is_personal.is_(True),
+                Expense.is_deleted.is_(False),
             )
         )
     ).scalars().first()

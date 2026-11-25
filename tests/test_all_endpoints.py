@@ -202,7 +202,4 @@ async def test_all_api_endpoints_end_to_end(client):
         )
         assert voice_a.status_code == 200
         assert voice_a.json()["status"] == "SUCCESS"
-
-    # 10. Staging routes (Backward Compatibility)
-    stg_list = await c.get("/staging")
-    assert stg_list.status_code == 200
+        assert voice_a.json()["staged_items"] == []

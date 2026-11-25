@@ -4,13 +4,13 @@ import uuid
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_session
-from app.models.expense import Expense
+from app.models.expense import Expense, ExpenseSplit
 from app.models.group import Group, GroupMember
 from app.models.settlement import Settlement
 from app.models.user import Friendship, User
@@ -104,14 +104,12 @@ async def get_group_details(
     if not group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found.")
 
-    # Check caller membership
     mem_query = select(GroupMember).where(
         GroupMember.group_id == group_id, GroupMember.user_id == current_user.id
     )
     if not (await session.execute(mem_query)).scalars().first():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this group.")
 
-    # Fetch members
     members_res = await session.execute(
         select(GroupMember, User)
         .join(User, GroupMember.user_id == User.id)
@@ -119,7 +117,6 @@ async def get_group_details(
     )
     member_records = members_res.all()
 
-    # Load caller's custom nicknames for group members
     member_user_ids = [u.id for _, u in member_records if u.id != current_user.id]
     nicknames_map: dict[uuid.UUID, str | None] = {}
     if member_user_ids:
@@ -145,12 +142,12 @@ async def get_group_details(
         for gm, u in member_records
     ]
 
-    # Calculate total spending in group
-    exp_res = await session.execute(
-        select(Expense).where(Expense.group_id == group_id, Expense.is_deleted.is_(False))
+    total_stmt = select(func.coalesce(func.sum(Expense.amount), Decimal("0.00"))).where(
+        Expense.group_id == group_id,
+        Expense.is_deleted.is_(False),
+        Expense.is_personal.is_(False),
     )
-    expenses = exp_res.scalars().all()
-    total_spending = sum((e.amount for e in expenses), Decimal("0.00"))
+    total_spending = Decimal(str((await session.execute(total_stmt)).scalar_one())).quantize(Decimal("0.01"))
 
     return GroupDetailRead(
         id=group.id,
@@ -180,7 +177,6 @@ async def add_group_member(
     if not group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found.")
 
-    # Verify caller is a group member
     caller_mem = (
         await session.execute(
             select(GroupMember).where(
@@ -194,14 +190,12 @@ async def add_group_member(
     ident = payload.identifier.strip()
     target_user: User | None = None
 
-    # Check if UUID
     try:
         user_uuid = uuid.UUID(ident)
         target_user = (await session.execute(select(User).where(User.id == user_uuid))).scalars().first()
     except ValueError:
         pass
 
-    # Check if email
     if not target_user and "@" in ident:
         target_user = (
             await session.execute(select(User).where(User.email == ident.lower()))
@@ -212,7 +206,6 @@ async def add_group_member(
             session.add(target_user)
             await session.flush()
 
-    # Check if phone
     if not target_user:
         target_user = (
             await session.execute(select(User).where(User.phone == ident))
@@ -224,7 +217,6 @@ async def add_group_member(
             session.add(target_user)
             await session.flush()
 
-    # Check if already a member
     existing_mem = (
         await session.execute(
             select(GroupMember).where(
@@ -237,7 +229,6 @@ async def add_group_member(
         mem = GroupMember(group_id=group_id, user_id=target_user.id, role=payload.role)
         session.add(mem)
 
-        # Also register reciprocal friendship between caller and target_user (clean custom-alias slots)
         if target_user.id != current_user.id:
             for u1, u2 in [(current_user, target_user), (target_user, current_user)]:
                 ship = (
@@ -298,7 +289,6 @@ async def join_group(
     )
     existing_mem = (await session.execute(mem_query)).scalars().first()
     if not existing_mem:
-        # Fetch existing group members before adding caller so we can create reciprocal friendships
         existing_members_res = await session.execute(
             select(GroupMember.user_id).where(GroupMember.group_id == group.id)
         )
@@ -352,28 +342,45 @@ async def get_group_activity_feed(
     if not group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found.")
 
-    # Fetch expenses with splits
+    mem_check = (
+        await session.execute(
+            select(GroupMember.id).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == current_user.id,
+            )
+        )
+    ).scalars().first()
+    if not mem_check:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this group.")
+
+    total_stmt = select(func.coalesce(func.sum(Expense.amount), Decimal("0.00"))).where(
+        Expense.group_id == group_id,
+        Expense.is_deleted.is_(False),
+        Expense.is_personal.is_(False),
+    )
+    total_spending = Decimal(str((await session.execute(total_stmt)).scalar_one())).quantize(Decimal("0.01"))
+
     exp_query = (
         select(Expense)
         .options(selectinload(Expense.splits))
-        .where(Expense.group_id == group_id, Expense.is_deleted.is_(False))
+        .where(
+            Expense.group_id == group_id,
+            Expense.is_deleted.is_(False),
+            Expense.is_personal.is_(False),
+        )
         .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
-        .offset(offset)
-        .limit(limit)
+        .limit(offset + limit)
     )
     expenses = (await session.execute(exp_query)).scalars().all()
 
-    # Fetch settlements
     set_query = (
         select(Settlement)
         .where(Settlement.group_id == group_id, Settlement.is_deleted.is_(False))
         .order_by(Settlement.settlement_date.desc())
-        .offset(offset)
-        .limit(limit)
+        .limit(offset + limit)
     )
     settlements = (await session.execute(set_query)).scalars().all()
 
-    # Load user names
     user_ids = {e.payer_id for e in expenses} | {s.payer_id for s in settlements} | {s.payee_id for s in settlements}
     for e in expenses:
         user_ids.update(sp.user_id for sp in e.splits)
@@ -386,14 +393,11 @@ async def get_group_activity_feed(
     timeline: list[ActivityTimelineItem] = []
 
     for e in expenses:
-        # Determine your share and net impact
         your_split = next((sp for sp in e.splits if sp.user_id == current_user.id), None)
         your_share = your_split.owed_amount if your_split else Decimal("0.00")
         if e.payer_id == current_user.id:
-            # You paid total e.amount, others owe (e.amount - your_share)
             impact = e.amount - your_share
         else:
-            # Someone else paid, you owe your_share
             impact = -your_share
 
         timeline.append(
@@ -414,11 +418,11 @@ async def get_group_activity_feed(
 
     for s in settlements:
         if s.payer_id == current_user.id:
-            impact = s.amount  # You paid: debt reduced
+            impact = s.amount
         elif s.payee_id == current_user.id:
-            impact = -s.amount  # You received money
+            impact = -s.amount
         else:
-            impact = Decimal("0.00")  # Between two other members
+            impact = Decimal("0.00")
 
         timeline.append(
             ActivityTimelineItem(
@@ -437,15 +441,13 @@ async def get_group_activity_feed(
             )
         )
 
-    # Sort combined timeline by date desc
     timeline.sort(key=lambda x: x.date, reverse=True)
-    total_spending = sum((e.amount for e in expenses), Decimal("0.00"))
 
     return GroupActivityFeed(
         group_id=group.id,
         group_name=group.name,
         total_spending=total_spending,
-        timeline=timeline,
+        timeline=timeline[offset : offset + limit],
     )
 
 
@@ -548,7 +550,6 @@ async def add_friend(
         raw_aliases=payload.aliases,
     )
 
-    # 1. Forward friendship: caller -> friend
     ship1 = (
         await session.execute(
             select(Friendship).where(
@@ -569,7 +570,6 @@ async def add_friend(
         )
         session.add(ship1)
 
-    # 2. Reciprocal friendship: friend -> caller (clean slot so friend sets their own alias)
     ship2 = (
         await session.execute(
             select(Friendship).where(
@@ -679,30 +679,28 @@ async def list_friends(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[FriendRead]:
-    """Retrieve all friends with spoken alias mappings."""
-    query = select(Friendship).where(Friendship.user_id == current_user.id)
-    ships = (await session.execute(query)).scalars().all()
+    """Retrieve all friends with spoken alias mappings in a single JOIN query."""
+    query = (
+        select(Friendship, User)
+        .join(User, Friendship.friend_id == User.id)
+        .where(Friendship.user_id == current_user.id)
+    )
+    rows = (await session.execute(query)).all()
 
-    friends_out: list[FriendRead] = []
-    for s in ships:
-        f_user = (
-            await session.execute(select(User).where(User.id == s.friend_id))
-        ).scalars().first()
-        if f_user:
-            friends_out.append(
-                FriendRead(
-                    id=s.id,
-                    user_id=s.user_id,
-                    friend_id=s.friend_id,
-                    friend_name=f_user.name,
-                    friend_email=f_user.email,
-                    friend_phone=f_user.phone,
-                    nickname=s.nickname,
-                    aliases=s.aliases,
-                    created_at=s.created_at,
-                )
-            )
-    return friends_out
+    return [
+        FriendRead(
+            id=s.id,
+            user_id=s.user_id,
+            friend_id=s.friend_id,
+            friend_name=f_user.name,
+            friend_email=f_user.email,
+            friend_phone=f_user.phone,
+            nickname=s.nickname,
+            aliases=s.aliases,
+            created_at=s.created_at,
+        )
+        for s, f_user in rows
+    ]
 
 
 @router.get(
@@ -732,30 +730,31 @@ async def get_bilateral_activity_feed(
     ).scalars().first()
     friend_nickname = ship.nickname if ship else None
 
-    # 1. Fetch expenses where both are involved
+    friend_split_exists = select(ExpenseSplit.id).where(
+        ExpenseSplit.expense_id == Expense.id,
+        ExpenseSplit.user_id == friend_id,
+    ).exists()
+    caller_split_exists = select(ExpenseSplit.id).where(
+        ExpenseSplit.expense_id == Expense.id,
+        ExpenseSplit.user_id == current_user.id,
+    ).exists()
+
     exp_query = (
         select(Expense)
         .options(selectinload(Expense.splits))
         .where(
             Expense.is_deleted.is_(False),
+            Expense.is_personal.is_(False),
             or_(
-                (Expense.payer_id == current_user.id),
-                (Expense.payer_id == friend_id),
+                (Expense.payer_id == current_user.id) & friend_split_exists,
+                (Expense.payer_id == friend_id) & caller_split_exists,
             ),
         )
         .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
+        .limit(offset + limit)
     )
-    all_candidate_exps = (await session.execute(exp_query)).scalars().all()
+    shared_expenses = (await session.execute(exp_query)).scalars().all()
 
-    # Filter to expenses where the other person has a split
-    shared_expenses: list[Expense] = []
-    for exp in all_candidate_exps:
-        has_current = any(sp.user_id == current_user.id for sp in exp.splits) or exp.payer_id == current_user.id
-        has_friend = any(sp.user_id == friend_id for sp in exp.splits) or exp.payer_id == friend_id
-        if has_current and has_friend:
-            shared_expenses.append(exp)
-
-    # 2. Fetch settlements between caller and friend
     set_query = (
         select(Settlement)
         .where(
@@ -766,20 +765,23 @@ async def get_bilateral_activity_feed(
             ),
         )
         .order_by(Settlement.settlement_date.desc())
+        .limit(offset + limit)
     )
     settlements = (await session.execute(set_query)).scalars().all()
 
-    # Calculate net balance specifically with this friend
-    net_balance = Decimal("0.00")
+    # Exact SQL-aggregated bilateral net_balance across all history
+    balances_summary = await get_user_balances(session, current_user.id)
+    friend_bal_entry = next((b for b in balances_summary.balances if b.user_id == friend_id), None)
+    net_balance = friend_bal_entry.net_balance if friend_bal_entry else Decimal("0.00")
     timeline: list[ActivityTimelineItem] = []
 
     for exp in shared_expenses:
         if exp.payer_id == current_user.id:
-            # Caller paid: friend owes their split amount
             friend_split = next((sp for sp in exp.splits if sp.user_id == friend_id), None)
+            caller_split = next((sp for sp in exp.splits if sp.user_id == current_user.id), None)
             if friend_split:
                 impact = friend_split.owed_amount
-                net_balance += impact
+                your_share = caller_split.owed_amount if caller_split else Decimal("0.00")
                 timeline.append(
                     ActivityTimelineItem(
                         type="EXPENSE",
@@ -791,16 +793,14 @@ async def get_bilateral_activity_feed(
                         payer_id=exp.payer_id,
                         payer_name=current_user.name,
                         group_id=exp.group_id,
-                        your_share=friend_split.owed_amount,
+                        your_share=your_share,
                         your_net_impact=impact,
                     )
                 )
         elif exp.payer_id == friend_id:
-            # Friend paid: caller owes their split amount
             caller_split = next((sp for sp in exp.splits if sp.user_id == current_user.id), None)
             if caller_split:
                 impact = -caller_split.owed_amount
-                net_balance += impact
                 timeline.append(
                     ActivityTimelineItem(
                         type="EXPENSE",
@@ -819,8 +819,6 @@ async def get_bilateral_activity_feed(
 
     for s in settlements:
         if s.payer_id == current_user.id:
-            # Caller paid friend: reduces debt to friend (increases net_balance)
-            net_balance += s.amount
             timeline.append(
                 ActivityTimelineItem(
                     type="SETTLEMENT",
@@ -838,8 +836,6 @@ async def get_bilateral_activity_feed(
                 )
             )
         else:
-            # Friend paid caller: friend reduced debt to caller
-            net_balance -= s.amount
             timeline.append(
                 ActivityTimelineItem(
                     type="SETTLEMENT",

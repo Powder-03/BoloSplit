@@ -1,13 +1,11 @@
-"""Voice command ingestion endpoints."""
+"""Voice command ingestion endpoints (Single-Pass Multimodal Direct-to-Ledger)."""
 
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from google.genai import types
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
-from app.config import settings
 from app.database import get_session
 from app.models.user import User
 from app.schemas.voice import VoiceCommandRequest, VoiceIngestResponse
@@ -19,7 +17,7 @@ router = APIRouter(prefix="/voice", tags=["Voice Ingestion"])
 @router.post(
     "/text",
     response_model=VoiceIngestResponse,
-    summary="Process voice command from transcribed text into staging queue",
+    summary="Process voice command from text directly to ledger",
 )
 async def ingest_voice_text(
     payload: VoiceCommandRequest,
@@ -55,7 +53,7 @@ async def ingest_voice_text(
 @router.post(
     "/audio",
     response_model=VoiceIngestResponse,
-    summary="Process raw audio recording directly using Gemini Multimodal Perception",
+    summary="Process raw audio recording in a single multimodal pass with directory context",
 )
 async def ingest_voice_audio(
     file: UploadFile = File(..., description="Audio recording file (e.g. wav, m4a, mp3, ogg, webm)"),
@@ -65,9 +63,8 @@ async def ingest_voice_audio(
     session: AsyncSession = Depends(get_session),
 ) -> VoiceIngestResponse:
     """
-    Ingest raw audio directly from mobile client microphone.
-
-    Uses Gemini 3.8 Flash multimodal audio perception to transcribe and extract intent.
+    Ingest raw audio directly from mobile client microphone in ONE multimodal Gemini call
+    with full friend/group directory context.
     """
     audio_bytes = await file.read()
     if not audio_bytes:
@@ -76,51 +73,12 @@ async def ingest_voice_audio(
             detail="Uploaded audio file is empty.",
         )
 
-    client = ai_pipeline.get_genai_client()
     mime_type = file.content_type or "audio/m4a"
-
-    # Multimodal audio transcription via Gemini
-    try:
-        response = await client.aio.models.generate_content(
-            model=settings.STAGE1_MODEL,
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                (
-                    "Transcribe this Hinglish/Indian English voice recording accurately. "
-                    "If the audio is silent, too noisy, garbled, or unintelligible so you cannot "
-                    "hear clear words, output only: [UNCLEAR]. Otherwise output only the verbatim transcript."
-                ),
-            ],
-        )
-        transcribed_text = response.text.strip() if response.text else ""
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Audio perception failed: {exc}",
-        ) from exc
-
-    cleaned_marker = transcribed_text.strip("[](). ").upper()
-    if not transcribed_text or "[UNCLEAR]" in transcribed_text.upper() or cleaned_marker in {
-        "UNCLEAR",
-        "INAUDIBLE",
-        "NO_SPEECH",
-        "SILENCE",
-    }:
-        msg = "Sound was not clear. Please speak again clearly."
-        return VoiceIngestResponse(
-            status="ERROR",
-            action_type="UNKNOWN",
-            count=0,
-            error_code="UNCLEAR_AUDIO",
-            spoken_confirmation=msg,
-            clarification_prompt=msg,
-            is_ambiguous=False,
-        )
-
     return await ai_pipeline.process_voice_pipeline(
         session=session,
         user=current_user,
-        command_text=transcribed_text,
+        audio_bytes=audio_bytes,
+        audio_mime_type=mime_type,
         client_timestamp_iso=client_timestamp_iso,
         group_id=group_id,
     )

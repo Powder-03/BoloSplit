@@ -1,6 +1,5 @@
 """Application configuration settings."""
 
-
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -24,7 +23,7 @@ class Settings(BaseSettings):
         default=["http://localhost:3000", "http://localhost:8081", "*"]
     )
 
-    # Database (defaults to local SQLite for rapid local dev/testing; override with PostgreSQL in production)
+    # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///./voicesplitwise.db"
     DATABASE_URL_SYNC: str = "sqlite:///./voicesplitwise.db"
 
@@ -46,11 +45,12 @@ class Settings(BaseSettings):
     GOOGLE_CLOUD_LOCATION: str = "global"
     GEMINI_API_KEY: str = ""
 
-    # Models
-    STAGE1_MODEL: str = "gemini-3.8-flash"
-    STAGE2_MODEL: str = "gemini-4-hydrogen"
+    # Single-pass Multimodal Gemini Model (with STAGE1/STAGE2 aliases for backward compatibility)
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    STAGE1_MODEL: str = "gemini-2.5-flash"
+    STAGE2_MODEL: str = "gemini-2.5-flash"
 
-    # Default Mock Auth
+    # Default Mock Auth (non-production only)
     DEFAULT_USER_EMAIL: str = "testuser@example.com"
     DEFAULT_USER_NAME: str = "Test User"
 

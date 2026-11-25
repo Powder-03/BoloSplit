@@ -18,9 +18,12 @@ from app.models.expense import Expense
 from app.models.settlement import Settlement
 from app.models.user import User
 from app.schemas.ai import (
+    ExactSplitItem,
     ExtractedItem,
     IntentType,
+    PercentageSplitItem,
     SettleExtraction,
+    ShareSplitItem,
     SplitTypeHint,
     StageOneOutput,
     StageTwoResolution,
@@ -566,3 +569,203 @@ async def test_on_friend_expense_excluded_from_self_and_isolated_across_users(te
             assert (await c.delete(f"/expenses/{exp_id}")).status_code == 403
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_friend_payer_exact_shares_group_default_and_incoming_settle(client_with_user):
+    """Verify all newly fixed pipeline capabilities:
+    1. Friend as payer ('Sahaj paid 500 for dinner with me')
+    2. EXACT and SHARES splits
+    3. Group expense default split across all members
+    4. Preserving PERCENTAGE splits on PATCH amount update
+    5. Incoming voice settlement ('Sahaj paid me 200')
+    """
+    client, caller, _ = client_with_user
+
+    f_res = (
+        await client.post(
+            "/friends",
+            json={"friend_phone": "+919877771122", "friend_name": "Sahaj", "nickname": "Sahaj"},
+        )
+    ).json()
+    sahaj_id = f_res["friend_id"]
+
+    # 1. Friend paid 500 split equally with me -> Sahaj is payer, caller owes Sahaj 250
+    mock_friend_paid = StageOneOutput(
+        intent=IntentType.CREATE,
+        confidence="HIGH",
+        items=[
+            ExtractedItem(
+                description="Dinner",
+                amount=500.0,
+                scope="SHARED",
+                payer_raw="Sahaj",
+                participants_raw=["me", "Sahaj"],
+                split_type=SplitTypeHint.EQUAL,
+            )
+        ],
+    )
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_friend_paid.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r1 = await client.post("/voice/text", json={"text": "Sahaj paid 500 for dinner with me"})
+    assert r1.status_code == 200
+    exp1 = r1.json()["expenses"][0]
+    assert exp1["payer_id"] == sahaj_id
+    assert len(exp1["splits"]) == 2
+
+    # 2. EXACT split: 500 total, 350 for Sahaj, 150 for me
+    mock_exact = StageOneOutput(
+        intent=IntentType.CREATE,
+        confidence="HIGH",
+        items=[
+            ExtractedItem(
+                description="Lunch",
+                amount=500.0,
+                scope="SHARED",
+                payer_raw="me",
+                split_type=SplitTypeHint.EXACT,
+                exact_splits=[
+                    ExactSplitItem(participant_raw="Sahaj", amount=350.0),
+                    ExactSplitItem(participant_raw="me", amount=150.0),
+                ],
+            )
+        ],
+    )
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_exact.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r2 = await client.post("/voice/text", json={"text": "500 lunch, 350 Sahaj and 150 me"})
+    exp2 = r2.json()["expenses"][0]
+    splits2 = {s["user_id"]: Decimal(str(s["owed_amount"])) for s in exp2["splits"]}
+    assert splits2[sahaj_id] == Decimal("350.00")
+    assert splits2[str(caller.id)] == Decimal("150.00")
+
+    # 3. SHARES split (2:1) & PERCENTAGE split preserved on PATCH amount change
+    mock_pct = StageOneOutput(
+        intent=IntentType.CREATE,
+        confidence="HIGH",
+        items=[
+            ExtractedItem(
+                description="Cab",
+                amount=500.0,
+                scope="SHARED",
+                payer_raw="me",
+                split_type=SplitTypeHint.PERCENTAGE,
+                percentage_splits=[
+                    PercentageSplitItem(participant_raw="me", percentage=20.0),
+                    PercentageSplitItem(participant_raw="Sahaj", percentage=80.0),
+                ],
+            )
+        ],
+    )
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_pct.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r3 = await client.post("/voice/text", json={"text": "500 cab 20% me 80% Sahaj"})
+    cab_id = r3.json()["expenses"][0]["id"]
+
+    # Update cab amount to 1000 via PATCH -> must keep 20%/80% (200 / 800), NOT 500/500!
+    patched = (await client.patch(f"/expenses/{cab_id}", json={"amount": "1000.00"})).json()
+    patched_splits = {s["user_id"]: Decimal(str(s["owed_amount"])) for s in patched["splits"]}
+    assert patched_splits[str(caller.id)] == Decimal("200.00")
+    assert patched_splits[sahaj_id] == Decimal("800.00")
+
+    # 4. Group expense without naming individual members splits across all group members
+    grp = (await client.post("/groups", json={"name": "Coorg Trip"})).json()
+    gid = grp["id"]
+    await client.post(f"/groups/{gid}/members", json={"identifier": sahaj_id})
+
+    mock_grp_exp = StageOneOutput(
+        intent=IntentType.CREATE,
+        confidence="HIGH",
+        items=[
+            ExtractedItem(
+                description="Snacks",
+                amount=300.0,
+                scope="SHARED",
+                payer_raw="me",
+                group_raw="Coorg Trip",
+                participants_raw=["me"],
+                split_type=SplitTypeHint.EQUAL,
+            )
+        ],
+    )
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_grp_exp.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r4 = await client.post("/voice/text", json={"text": "Add 300 snacks in Coorg Trip"})
+    exp4 = r4.json()["expenses"][0]
+    assert len(exp4["splits"]) == 2
+    assert all(Decimal(str(s["owed_amount"])) == Decimal("150.00") for s in exp4["splits"])
+
+    # 5. Incoming settlement: "Sahaj paid me 200" -> payer_id == sahaj_id, payee_id == caller.id
+    mock_incoming_settle = StageOneOutput(
+        intent=IntentType.SETTLE,
+        confidence="HIGH",
+        settle_item=SettleExtraction(payer_raw="Sahaj", payee_raw="me", amount=200.0),
+    )
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_incoming_settle.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r5 = await client.post("/voice/text", json={"text": "Sahaj paid me 200"})
+    assert r5.status_code == 200
+    s_data = r5.json()["settlement"]
+    assert s_data["payer_id"] == sahaj_id
+    assert s_data["payee_id"] == str(caller.id)
+
+    # 6. Second-Pass Fix: "Sahaj paid 500 for dinner" where LLM sets participants_raw=["Sahaj"]
+    # still includes caller.id in splits so caller isn't locked out of the expense
+    mock_friend_only_part = StageOneOutput(
+        intent=IntentType.CREATE,
+        confidence="HIGH",
+        items=[
+            ExtractedItem(
+                description="Late Dinner",
+                amount=400.0,
+                scope="SHARED",
+                payer_raw="Sahaj",
+                participants_raw=["Sahaj"],
+                split_type=SplitTypeHint.EQUAL,
+            )
+        ],
+    )
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_friend_only_part.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r6 = await client.post("/voice/text", json={"text": "Sahaj paid 400 for late dinner"})
+    exp6 = r6.json()["expenses"][0]
+    assert exp6["payer_id"] == sahaj_id
+    assert {s["user_id"] for s in exp6["splits"]} == {sahaj_id, str(caller.id)}
+
+    # 7. Second-Pass Fix: Single-pass UPDATE preserves specific description ("Late Dinner") & category
+    # when user says "Update dinner to 450"
+    mock_single_pass_update = StageOneOutput(
+        intent=IntentType.UPDATE,
+        confidence="HIGH",
+        target_record_id=exp6["id"],
+        items=[
+            ExtractedItem(
+                description="Dinner",
+                amount=450.0,
+                category="general",
+            )
+        ],
+    )
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text=mock_single_pass_update.model_dump_json())
+    )
+    with patch("app.services.ai_pipeline.get_genai_client", return_value=mock_client):
+        r7 = await client.post("/voice/text", json={"text": "Update dinner to 450"})
+    assert r7.status_code == 200
+    exp7 = r7.json()["expenses"][0]
+    assert Decimal(str(exp7["amount"])) == Decimal("450.00")
+    assert exp7["description"] == "Late Dinner"  # Not overwritten by shorter search keyword "Dinner"
+    assert exp7["payer_name"] == "Sahaj"

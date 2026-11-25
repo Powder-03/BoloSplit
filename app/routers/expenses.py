@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
@@ -18,7 +19,10 @@ from app.schemas.ledger import (
     ExpenseRead,
     ExpenseUpdate,
 )
-from app.services.ledger_service import calculate_equal_splits
+from app.services.ledger_service import (
+    calculate_equal_splits,
+    recalculate_splits_on_amount_change,
+)
 
 router = APIRouter(prefix="/expenses", tags=["Shared Expenses Ledger"])
 
@@ -107,21 +111,13 @@ async def list_expenses(
     if scope == "self":
         return []
 
-    other_split_subquery = select(ExpenseSplit.id).where(
-        ExpenseSplit.expense_id == Expense.id,
-        ExpenseSplit.user_id != current_user.id,
-    )
     query = (
         select(Expense)
         .options(selectinload(Expense.splits))
         .where(
             Expense.is_deleted.is_(False),
+            Expense.is_personal.is_(False),
             _user_accessible_expense_clause(current_user.id),
-            or_(
-                Expense.group_id.is_not(None),
-                Expense.payer_id != current_user.id,
-                other_split_subquery.exists(),
-            ),
         )
         .order_by(Expense.expense_date.desc(), Expense.created_at.desc())
     )
@@ -145,7 +141,22 @@ async def create_expense_manual(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> ExpenseRead:
-    """Manual fallback form creation for an expense and its splits."""
+    """Manual fallback form creation for a shared expense and its splits."""
+    if payload.group_id is not None:
+        mem_check = (
+            await session.execute(
+                select(GroupMember.id).where(
+                    GroupMember.group_id == payload.group_id,
+                    GroupMember.user_id == current_user.id,
+                )
+            )
+        ).scalars().first()
+        if not mem_check:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Group not found or you are not a member of this group.",
+            )
+
     expense = Expense(
         group_id=payload.group_id,
         description=payload.description,
@@ -154,31 +165,51 @@ async def create_expense_manual(
         payer_id=payload.payer_id,
         category=payload.category or "general",
         expense_date=payload.expense_date or datetime.now(UTC),
+        is_personal=False,
         is_deleted=False,
     )
     session.add(expense)
     await session.flush()
 
     if payload.splits:
-        split_sum = sum(s.owed_amount for s in payload.splits)
+        # Merge duplicate user_id entries if caller supplied any
+        merged_splits: dict[uuid.UUID, tuple[Decimal, str, Decimal | None]] = {}
+        for s in payload.splits:
+            if s.user_id in merged_splits:
+                prev_owed, prev_type, prev_val = merged_splits[s.user_id]
+                next_val = (prev_val + s.split_value) if (prev_val is not None and s.split_value is not None) else prev_val
+                merged_splits[s.user_id] = (prev_owed + s.owed_amount, prev_type, next_val)
+            else:
+                merged_splits[s.user_id] = (s.owed_amount, s.split_type, s.split_value)
+
+        split_sum = sum(owed for owed, _, _ in merged_splits.values())
         if split_sum != payload.amount:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Split amounts sum ({split_sum}) does not equal total amount ({payload.amount}).",
             )
-        for s in payload.splits:
-            split = ExpenseSplit(
-                expense_id=expense.id,
-                user_id=s.user_id,
-                owed_amount=s.owed_amount,
-                split_type=s.split_type,
-                split_value=s.split_value,
+        for uid, (owed, stype, sval) in merged_splits.items():
+            session.add(
+                ExpenseSplit(
+                    expense_id=expense.id,
+                    user_id=uid,
+                    owed_amount=owed,
+                    split_type=stype,
+                    split_value=sval,
+                )
             )
-            session.add(split)
     else:
-        participants = [current_user.id]
-        if payload.payer_id not in participants:
-            participants.append(payload.payer_id)
+        participants: list[uuid.UUID] = []
+        if payload.group_id is not None:
+            grp_mem_res = await session.execute(
+                select(GroupMember.user_id).where(GroupMember.group_id == payload.group_id)
+            )
+            participants = list(grp_mem_res.scalars().all())
+
+        if not participants:
+            participants = [current_user.id]
+            if payload.payer_id not in participants:
+                participants.append(payload.payer_id)
 
         calculated = calculate_equal_splits(
             amount=payload.amount,
@@ -186,13 +217,14 @@ async def create_expense_manual(
             payer_id=payload.payer_id,
         )
         for u_id, owed in calculated:
-            split = ExpenseSplit(
-                expense_id=expense.id,
-                user_id=u_id,
-                owed_amount=owed,
-                split_type="EQUAL",
+            session.add(
+                ExpenseSplit(
+                    expense_id=expense.id,
+                    user_id=u_id,
+                    owed_amount=owed,
+                    split_type="EQUAL",
+                )
             )
-            session.add(split)
 
     await session.commit()
 
@@ -223,7 +255,11 @@ async def get_expense_detail(
     query = (
         select(Expense)
         .options(selectinload(Expense.splits))
-        .where(Expense.id == expense_id, Expense.is_deleted.is_(False))
+        .where(
+            Expense.id == expense_id,
+            Expense.is_deleted.is_(False),
+            Expense.is_personal.is_(False),
+        )
     )
     result = await session.execute(query)
     expense = result.scalars().first()
@@ -255,11 +291,15 @@ async def update_expense(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> ExpenseRead:
-    """Edit an existing expense amount or description directly from activity feed."""
+    """Edit an existing expense amount or description directly from activity feed, preserving split proportions."""
     query = (
         select(Expense)
         .options(selectinload(Expense.splits))
-        .where(Expense.id == expense_id, Expense.is_deleted.is_(False))
+        .where(
+            Expense.id == expense_id,
+            Expense.is_deleted.is_(False),
+            Expense.is_personal.is_(False),
+        )
     )
     expense = (await session.execute(query)).scalars().first()
     if not expense:
@@ -279,15 +319,12 @@ async def update_expense(
 
     if payload.amount is not None and payload.amount != expense.amount:
         expense.amount = payload.amount
-        # Rebalance equal splits
         if expense.splits:
-            p_ids = [s.user_id for s in expense.splits]
-            recalculated = calculate_equal_splits(expense.amount, p_ids, payer_id=expense.payer_id)
-            for split in expense.splits:
-                for uid, owed in recalculated:
-                    if split.user_id == uid:
-                        split.owed_amount = owed
-                        break
+            recalculate_splits_on_amount_change(
+                new_amount=expense.amount,
+                existing_splits=expense.splits,
+                payer_id=expense.payer_id,
+            )
 
     expense.updated_at = datetime.now(UTC)
     await session.commit()
@@ -310,7 +347,11 @@ async def delete_expense(
     session: AsyncSession = Depends(get_session),
 ) -> None:
     """Soft delete an expense from the verified ledger."""
-    query = select(Expense).where(Expense.id == expense_id, Expense.is_deleted.is_(False))
+    query = select(Expense).where(
+        Expense.id == expense_id,
+        Expense.is_deleted.is_(False),
+        Expense.is_personal.is_(False),
+    )
     expense = (await session.execute(query)).scalars().first()
     if not expense:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found.")

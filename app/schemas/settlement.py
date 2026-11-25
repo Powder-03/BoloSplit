@@ -8,8 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class SettlementCreate(BaseModel):
-    """Payload to record a settlement payment."""
+    """Payload to record a settlement payment (supports both outgoing and incoming payments)."""
 
+    payer_id: uuid.UUID | None = Field(
+        default=None,
+        description="User ID of person who paid (defaults to current_user if omitted; set to friend's ID when friend paid you).",
+    )
     payee_id: uuid.UUID = Field(..., description="User ID of person receiving the money.")
     amount: Decimal = Field(..., gt=0, description="Amount paid in decimal.")
     currency: str = Field(default="INR", max_length=10)

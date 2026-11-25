@@ -1,4 +1,4 @@
-"""Pydantic schemas for AI extraction, intent classification, and resolution."""
+"""Pydantic schemas for single-pass multimodal AI extraction and ledger resolution."""
 
 from decimal import Decimal
 from enum import StrEnum
@@ -36,14 +36,28 @@ class SplitTypeHint(StrEnum):
 
 
 class PercentageSplitItem(BaseModel):
-    """Percentage split assignment for a single participant."""
+    """Percentage, exact amount, or share weight assignment for a single participant."""
 
-    participant_raw: str = Field(..., description="Spoken name or alias (e.g. 'me', 'Sahaj').")
-    percentage: float = Field(..., description="Percentage number (e.g. 20.0, 40.0).")
+    participant_raw: str = Field(..., description="Spoken name, alias, or UUID (e.g. 'me', 'Sahaj').")
+    percentage: float = Field(..., description="Percentage (0-100), exact amount in INR, or share weight.")
+
+
+class ExactSplitItem(BaseModel):
+    """Exact INR amount assignment for a single participant."""
+
+    participant_raw: str = Field(..., description="Spoken name, alias, or UUID (e.g. 'me', 'Sahaj').")
+    amount: float = Field(..., description="Exact amount owed by this participant in INR.")
+
+
+class ShareSplitItem(BaseModel):
+    """Relative share weight assignment for a single participant."""
+
+    participant_raw: str = Field(..., description="Spoken name, alias, or UUID (e.g. 'me', 'Sahaj').")
+    shares: float = Field(..., description="Relative share weight (e.g. 1.0, 2.0).")
 
 
 class ExtractedItem(BaseModel):
-    """Single expense item extracted from voice or transcript in Stage 1."""
+    """Single expense item extracted from voice audio or text in a single pass."""
 
     description: str = Field(
         ...,
@@ -59,16 +73,24 @@ class ExtractedItem(BaseModel):
         description="SELF for strictly personal expenses (no friends/groups); SHARED for friends or groups.",
     )
     payer_raw: str | None = Field(
+        default="me",
+        description="Who paid: 'me' if caller paid, or spoken friend name/nickname if a friend paid.",
+    )
+    payer_user_id: str | None = Field(
         default=None,
-        description="Spoken payer expression (e.g. 'me', 'mine', 'Sahaj', 'Rohit').",
+        description="Optional matched user_id from Known Directory if resolved directly.",
     )
     participants_raw: list[str] = Field(
         default_factory=list,
-        description="List of spoken participant names or expressions (e.g. ['Sahaj'], ['me', 'Sahaj']).",
+        description="List of spoken participant names/nicknames (e.g. ['Sahaj'], ['me', 'Sahaj']).",
     )
     group_raw: str | None = Field(
         default=None,
-        description="Raw spoken group name if mentioned (e.g. 'Goa Trip', 'Flatmates').",
+        description="Spoken group name if mentioned (e.g. 'Goa Trip', 'Flatmates').",
+    )
+    group_id: str | None = Field(
+        default=None,
+        description="Optional matched group_id UUID from Known Groups.",
     )
     category: str | None = Field(
         default="general",
@@ -80,23 +102,38 @@ class ExtractedItem(BaseModel):
     )
     split_type: SplitTypeHint = Field(
         default=SplitTypeHint.EQUAL,
-        description="Detected split type hint.",
+        description="Detected split type: EQUAL, PERCENTAGE, EXACT, or SHARES.",
     )
     percentage_splits: list[PercentageSplitItem] = Field(
         default_factory=list,
         description="List of percentage assignments if split_type is PERCENTAGE.",
     )
+    exact_splits: list[ExactSplitItem] = Field(
+        default_factory=list,
+        description="List of exact currency assignments if split_type is EXACT.",
+    )
+    share_splits: list[ShareSplitItem] = Field(
+        default_factory=list,
+        description="List of share ratio assignments if split_type is SHARES.",
+    )
     split_details_raw: str | None = Field(
         default=None,
-        description="Any specific raw split details mentioned (e.g., '60-40', 'Sahaj gave 200').",
+        description="Optional raw split note.",
     )
 
 
 class SettleExtraction(BaseModel):
-    """Details for a debt settlement command ('I paid Sahaj 250 via GPay')."""
+    """Details for a bidirectional debt settlement command ('I paid Sahaj 250' or 'Sahaj paid me 250')."""
 
-    payee_raw: str = Field(..., description="Person who received the money (e.g. 'Sahaj').")
-    amount: float = Field(..., description="Amount paid.")
+    payer_raw: str = Field(
+        default="me",
+        description="Person who paid the money ('me' if caller paid friend; friend's name if friend paid caller).",
+    )
+    payee_raw: str = Field(
+        ...,
+        description="Person who received the money (friend's name if caller paid friend; 'me' if friend paid caller).",
+    )
+    amount: float = Field(..., description="Amount paid in INR.")
     currency: str = Field(default="INR")
     payment_method: str = Field(default="UPI", description="UPI, CASH, GPAY, etc.")
     group_raw: str | None = Field(default=None, description="Group name if settling in a group.")
@@ -104,15 +141,15 @@ class SettleExtraction(BaseModel):
 
 
 class CandidateSearchQuery(BaseModel):
-    """Parameters to search candidate expenses in DB for UPDATE/DELETE/complex actions."""
+    """Parameters to search or disambiguate existing expenses for UPDATE or DELETE."""
 
     description_keywords: list[str] = Field(
         default_factory=list,
-        description="Keywords to match expense descriptions (e.g. ['petrol', 'fuel']).",
+        description="Single-word core keywords to match expense descriptions (e.g. ['petrol']).",
     )
     amount_hint: float | None = Field(
         default=None,
-        description="Expected amount or previous amount if mentioned.",
+        description="Expected current amount or new amount if mentioned.",
     )
     date_target_iso: str | None = Field(
         default=None,
@@ -125,7 +162,7 @@ class CandidateSearchQuery(BaseModel):
 
 
 class StageOneOutput(BaseModel):
-    """Structured output returned by Stage 1 Gemini 3.8 Flash model."""
+    """Unified single-pass structured output returned by Gemini multimodal perception."""
 
     intent: IntentType = Field(
         ...,
@@ -133,23 +170,23 @@ class StageOneOutput(BaseModel):
     )
     confidence: str = Field(
         default="HIGH",
-        description="Extraction confidence: HIGH, MEDIUM, or LOW.",
+        description="Extraction confidence: HIGH, MEDIUM, LOW, or AMBIGUOUS.",
     )
     ambiguity_reason: str | None = Field(
         default=None,
-        description="Explanation when confidence is MEDIUM or LOW.",
+        description="Explanation when confidence is MEDIUM, LOW, or AMBIGUOUS.",
     )
     is_complex: bool = Field(
         default=False,
-        description="True if relative past dates, UPDATE, DELETE, settlements, or unequal splits require Stage 2 reasoning.",
+        description="Backward-compatible flag.",
     )
     complexity_reason: str | None = Field(
         default=None,
-        description="Explanation why this command was marked complex.",
+        description="Backward-compatible note.",
     )
     items: list[ExtractedItem] = Field(
         default_factory=list,
-        description="List of parsed expense items (supports MULTI_CREATE).",
+        description="List of parsed expense items (for CREATE, MULTI_CREATE, or UPDATE new values).",
     )
     settle_item: SettleExtraction | None = Field(
         default=None,
@@ -157,7 +194,19 @@ class StageOneOutput(BaseModel):
     )
     search_query: CandidateSearchQuery | None = Field(
         default=None,
-        description="Search query to fetch DB candidate records for Stage 2.",
+        description="Search parameters for UPDATE or DELETE.",
+    )
+    target_record_id: str | None = Field(
+        default=None,
+        description="For UPDATE/DELETE: matched expense ID from Recent Expenses Context when unambiguous.",
+    )
+    ambiguous_candidate_ids: list[str] = Field(
+        default_factory=list,
+        description="For UPDATE/DELETE: list of conflicting expense IDs when 2+ records match.",
+    )
+    clarification_question: str | None = Field(
+        default=None,
+        description="Question to ask user when multiple records or friends match.",
     )
     spoken_confirmation: str | None = Field(
         default=None,
@@ -165,93 +214,37 @@ class StageOneOutput(BaseModel):
     )
 
 
-class ResolvedSplit(BaseModel):
-    """Resolved split participant with exact owed amount."""
+# Backward-compatible aliases for tests and external callers
+VoiceExtractionOutput = StageOneOutput
 
-    user_id: str | None = Field(
-        default=None,
-        description="Resolved user UUID string, if mapped.",
-    )
-    raw_name: str = Field(
-        ...,
-        description="Participant spoken name or label.",
-    )
-    owed_amount: Decimal = Field(
-        ...,
-        description="Exact portion owed in Decimal paise.",
-    )
-    is_payer: bool = Field(
-        default=False,
-        description="Whether this participant paid.",
-    )
+
+class ResolvedSplit(BaseModel):
+    """Backward-compatible resolved split item."""
+
+    user_id: str | None = None
+    raw_name: str
+    owed_amount: Decimal
+    is_payer: bool = False
 
 
 class StageTwoResolution(BaseModel):
-    """Structured resolution returned by Stage 2 Gemini 4 Hydrogen model."""
+    """Backward-compatible resolution model."""
 
-    action_type: str = Field(
-        ...,
-        description="Final action: CREATE, UPDATE, DELETE, SETTLE, or CLARIFICATION_REQUIRED.",
-    )
-    group_id: str | None = Field(
-        default=None,
-        description="Resolved Group UUID if expense or settlement belongs to a group.",
-    )
-    target_record_id: str | None = Field(
-        default=None,
-        description="Target record UUID if updating or deleting an existing expense.",
-    )
-    target_source: str | None = Field(
-        default="verified",
-        description="'verified' for expenses, 'settlements' for settlements.",
-    )
-    confidence: str = Field(
-        default="HIGH",
-        description="Confidence level: HIGH, MEDIUM, or AMBIGUOUS.",
-    )
-    ambiguous_candidate_ids: list[str] = Field(
-        default_factory=list,
-        description="IDs of conflicting candidates when 2+ matching records exist.",
-    )
-    description: str = Field(
-        default="",
-        description="Refined description of the expense or payment.",
-    )
-    amount: Decimal = Field(
-        default=Decimal("0.00"),
-        description="Total expense or settlement amount in Decimal.",
-    )
-    currency: str = Field(default="INR")
-    payer_user_id: str | None = Field(
-        default=None,
-        description="UUID of payer.",
-    )
-    payer_name: str | None = Field(
-        default=None,
-        description="Name of payer.",
-    )
-    payee_user_id: str | None = Field(
-        default=None,
-        description="UUID of payee (for SETTLE).",
-    )
-    payee_name: str | None = Field(
-        default=None,
-        description="Name of payee (for SETTLE).",
-    )
-    resolved_splits: list[ResolvedSplit] = Field(
-        default_factory=list,
-        description="Exact splits summing to total amount.",
-    )
-    expense_date_iso: str | None = Field(
-        default=None,
-        description="Target expense date.",
-    )
-    category: str | None = Field(default="general")
-    spoken_confirmation: str | None = Field(
-        default=None,
-        description="Friendly Hinglish reply for the user.",
-    )
-    clarification_question: str | None = Field(
-        default=None,
-        description="Question to ask if ambiguous candidates require clarification.",
-    )
+    action_type: str = "UPDATE"
+    group_id: str | None = None
+    target_record_id: str | None = None
+    target_source: str | None = "verified"
+    confidence: str = "HIGH"
+    ambiguous_candidate_ids: list[str] = Field(default_factory=list)
+    description: str = ""
+    amount: Decimal = Decimal("0.00")
+    currency: str = "INR"
+    payer_user_id: str | None = None
+    payer_name: str | None = None
+    payee_user_id: str | None = None
+    payee_name: str | None = None
+    resolved_splits: list[ResolvedSplit] = Field(default_factory=list)
+    expense_date_iso: str | None = None
+    category: str | None = "general"
+    spoken_confirmation: str | None = None
+    clarification_question: str | None = None
