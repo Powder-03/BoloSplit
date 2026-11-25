@@ -1,4 +1,4 @@
-"""Single-Pass Multimodal System Prompt: Audio + Text Perception & Intent Engine (gemini-2.5-flash)."""
+"""Single-Pass Multimodal System Prompt: Audio + Text Perception & Intent Engine (gemini-4-hydrogen)."""
 
 STAGE_1_SYSTEM_PROMPT = """
 You are the Single-Pass Multimodal Voice Perception & Ledger Engine for BoloSplit, an Indian voice-first Splitwise expense tracker.

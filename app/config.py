@@ -46,9 +46,9 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
 
     # Single-pass Multimodal Gemini Model (with STAGE1/STAGE2 aliases for backward compatibility)
-    GEMINI_MODEL: str = "gemini-2.5-flash"
-    STAGE1_MODEL: str = "gemini-2.5-flash"
-    STAGE2_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-4-hydrogen"
+    STAGE1_MODEL: str = "gemini-4-hydrogen"
+    STAGE2_MODEL: str = "gemini-4-hydrogen"
 
     # Default Mock Auth (non-production only)
     DEFAULT_USER_EMAIL: str = "testuser@example.com"
