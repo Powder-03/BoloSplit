@@ -13,6 +13,11 @@ from app.models.group import GroupMember
 from app.models.settlement import Settlement
 from app.models.user import User
 from app.schemas.settlement import SettlementCreate, SettlementRead
+from app.services.activity_service import (
+    EVENT_SETTLEMENT_CREATED,
+    EVENT_SETTLEMENT_DELETED,
+    record_settlement_activity,
+)
 
 router = APIRouter(prefix="/settlements", tags=["Settlements ('Settle Up')"])
 
@@ -87,6 +92,13 @@ async def create_settlement(
         is_deleted=False,
     )
     session.add(settlement)
+    await session.flush()
+    await record_settlement_activity(
+        session=session,
+        settlement=settlement,
+        actor_id=current_user.id,
+        event_type=EVENT_SETTLEMENT_CREATED,
+    )
     await session.commit()
     await session.refresh(settlement)
 
@@ -200,4 +212,10 @@ async def delete_settlement(
     settlement.is_deleted = True
     settlement.updated_at = datetime.now(UTC)
     session.add(settlement)
+    await record_settlement_activity(
+        session=session,
+        settlement=settlement,
+        actor_id=current_user.id,
+        event_type=EVENT_SETTLEMENT_DELETED,
+    )
     await session.commit()

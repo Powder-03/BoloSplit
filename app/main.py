@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import init_db
+from app.routers.activity import router as activity_router
 from app.routers.expenses import router as expenses_router
 from app.routers.groups import router as groups_router
 from app.routers.self_expenses import router as self_expenses_router
@@ -57,6 +58,7 @@ core_routers = [
     self_expenses_router,
     expenses_router,
     groups_router,
+    activity_router,
 ]
 
 for r in core_routers:

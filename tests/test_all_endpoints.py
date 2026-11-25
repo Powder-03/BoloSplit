@@ -160,9 +160,15 @@ async def test_all_api_endpoints_end_to_end(client):
     set_del = await c.delete(f"/settlements/{settlement_id}")
     assert set_del.status_code == 204
 
-    # 8. Delete Expense
+    # 8. Delete Expense & verify Activity Log
     exp_del = await c.delete(f"/expenses/{expense_id}")
     assert exp_del.status_code == 204
+
+    act_res = await c.get("/activity")
+    assert act_res.status_code == 200
+    act_events = [item["event_type"] for item in act_res.json()]
+    assert "EXPENSE_DELETED" in act_events
+    assert "SETTLEMENT_DELETED" in act_events
 
     # 9. Voice Text & Voice Audio
     mock_stage1 = StageOneOutput(

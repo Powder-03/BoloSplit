@@ -216,3 +216,24 @@ async def test_create_and_get_self_expenses(client_with_user):
     v1_res = await client.get("/api/v1/expenses/self")
     assert v1_res.status_code == 200
     assert Decimal(str(v1_res.json()["total_spending"])) == Decimal("2500.00")
+
+
+@pytest.mark.asyncio
+async def test_self_expenses_category_normalization_and_empty_category(client_with_user):
+    client, _ = client_with_user
+
+    # Mix case and None/empty categories (ensures Python normalization merges cleanly without SQL GROUP BY bugs)
+    r1 = await client.post("/expenses/self", json={"description": "Tea", "amount": "40.00", "category": "Food"})
+    r2 = await client.post("/expenses/self", json={"description": "Snacks", "amount": "60.00", "category": "food"})
+    r3 = await client.post("/expenses/self", json={"description": "Misc", "amount": "100.00", "category": None})
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    assert r3.status_code == 201
+
+    res = await client.get("/expenses/self")
+    assert res.status_code == 200
+    data = res.json()
+    cats = {c["category"]: (Decimal(str(c["total_amount"])), c["count"]) for c in data["categories"]}
+    assert cats["food"] == (Decimal("100.00"), 2)
+    assert cats["general"] == (Decimal("100.00"), 1)
+

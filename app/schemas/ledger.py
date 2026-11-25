@@ -3,6 +3,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -287,3 +288,31 @@ class GroupActivityFeed(BaseModel):
     total_spending: Decimal
     currency: str = "INR"
     timeline: list[ActivityTimelineItem] = Field(default_factory=list)
+
+
+class ActivityLogRead(BaseModel):
+    """Unified activity log entry returned by GET /activity."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    event_type: str
+    entity_type: str
+    entity_id: uuid.UUID
+    actor_id: uuid.UUID
+    actor_name: str
+    is_actor_you: bool = False
+    group_id: uuid.UUID | None = None
+    group_name: str | None = None
+    description: str
+    amount: Decimal
+    currency: str = "INR"
+    category: str | None = "general"
+    payer_id: uuid.UUID | None = None
+    payer_name: str | None = None
+    payee_id: uuid.UUID | None = None
+    payee_name: str | None = None
+    summary_text: str
+    is_entity_deleted: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime

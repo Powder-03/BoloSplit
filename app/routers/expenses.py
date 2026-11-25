@@ -3,6 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
@@ -18,6 +19,12 @@ from app.schemas.ledger import (
     ExpenseCreate,
     ExpenseRead,
     ExpenseUpdate,
+)
+from app.services.activity_service import (
+    EVENT_EXPENSE_CREATED,
+    EVENT_EXPENSE_DELETED,
+    EVENT_EXPENSE_UPDATED,
+    record_expense_activity,
 )
 from app.services.ledger_service import (
     calculate_equal_splits,
@@ -198,6 +205,7 @@ async def create_expense_manual(
                     split_value=sval,
                 )
             )
+        split_user_ids = list(merged_splits.keys())
     else:
         participants: list[uuid.UUID] = []
         if payload.group_id is not None:
@@ -225,7 +233,15 @@ async def create_expense_manual(
                     split_type="EQUAL",
                 )
             )
+        split_user_ids = [u_id for u_id, _ in calculated]
 
+    await record_expense_activity(
+        session=session,
+        expense=expense,
+        actor_id=current_user.id,
+        event_type=EVENT_EXPENSE_CREATED,
+        split_user_ids=split_user_ids,
+    )
     await session.commit()
 
     fetch_query = (
@@ -310,6 +326,11 @@ async def update_expense(
             detail="Not authorized to update this expense.",
         )
 
+    prev_description = expense.description
+    prev_amount = expense.amount
+    prev_category = expense.category
+    prev_date = expense.expense_date
+
     if payload.description is not None:
         expense.description = payload.description
     if payload.category is not None:
@@ -326,7 +347,25 @@ async def update_expense(
                 payer_id=expense.payer_id,
             )
 
+    update_meta: dict[str, Any] = {}
+    if expense.description != prev_description:
+        update_meta["previous_description"] = prev_description
+    if expense.amount != prev_amount:
+        update_meta["previous_amount"] = str(prev_amount)
+    if expense.category != prev_category:
+        update_meta["previous_category"] = prev_category
+
+    changed = bool(update_meta) or (expense.expense_date != prev_date)
     expense.updated_at = datetime.now(UTC)
+    if changed:
+        await record_expense_activity(
+            session=session,
+            expense=expense,
+            actor_id=current_user.id,
+            event_type=EVENT_EXPENSE_UPDATED,
+            split_user_ids=[s.user_id for s in expense.splits],
+            metadata=update_meta,
+        )
     await session.commit()
     await session.refresh(expense)
     payer_user = (await session.execute(select(User).where(User.id == expense.payer_id))).scalars().first()
@@ -346,11 +385,15 @@ async def delete_expense(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> None:
-    """Soft delete an expense from the verified ledger."""
-    query = select(Expense).where(
-        Expense.id == expense_id,
-        Expense.is_deleted.is_(False),
-        Expense.is_personal.is_(False),
+    """Soft delete an expense from the verified ledger and record an activity log."""
+    query = (
+        select(Expense)
+        .options(selectinload(Expense.splits))
+        .where(
+            Expense.id == expense_id,
+            Expense.is_deleted.is_(False),
+            Expense.is_personal.is_(False),
+        )
     )
     expense = (await session.execute(query)).scalars().first()
     if not expense:
@@ -364,4 +407,11 @@ async def delete_expense(
     expense.is_deleted = True
     expense.updated_at = datetime.now(UTC)
     session.add(expense)
+    await record_expense_activity(
+        session=session,
+        expense=expense,
+        actor_id=current_user.id,
+        event_type=EVENT_EXPENSE_DELETED,
+        split_user_ids=[s.user_id for s in expense.splits],
+    )
     await session.commit()

@@ -445,21 +445,24 @@ async def get_self_expenses_summary(
 
     cat_stmt = (
         select(
-            func.lower(func.coalesce(Expense.category, "general")),
+            Expense.category,
             func.coalesce(func.sum(Expense.amount), Decimal("0.00")),
             func.count(Expense.id),
         )
         .where(*cat_filters)
-        .group_by(func.lower(func.coalesce(Expense.category, "general")))
+        .group_by(Expense.category)
     )
     cat_rows = (await session.execute(cat_stmt)).all()
+    cat_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0.00"))
+    cat_counts: dict[str, int] = defaultdict(int)
+    for raw_name, c_sum, c_cnt in cat_rows:
+        norm_cat = (raw_name or "general").strip().lower() or "general"
+        cat_totals[norm_cat] += Decimal(str(c_sum)).quantize(Decimal("0.01"))
+        cat_counts[norm_cat] += int(c_cnt)
+
     categories = [
-        SelfCategoryStat(
-            category=(c_name or "general").strip(),
-            total_amount=Decimal(str(c_sum)).quantize(Decimal("0.01")),
-            count=int(c_cnt),
-        )
-        for c_name, c_sum, c_cnt in cat_rows
+        SelfCategoryStat(category=cat, total_amount=amt, count=cat_counts[cat])
+        for cat, amt in cat_totals.items()
     ]
     categories.sort(key=lambda c: c.total_amount, reverse=True)
 

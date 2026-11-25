@@ -30,6 +30,14 @@ from app.schemas.ai import (
 from app.schemas.ledger import ExpenseRead, SelfExpenseRead
 from app.schemas.settlement import SettlementRead
 from app.schemas.voice import VoiceIngestResponse
+from app.services.activity_service import (
+    EVENT_EXPENSE_CREATED,
+    EVENT_EXPENSE_DELETED,
+    EVENT_EXPENSE_UPDATED,
+    EVENT_SETTLEMENT_CREATED,
+    record_expense_activity,
+    record_settlement_activity,
+)
 from app.services.ledger_service import (
     compute_splits,
     get_user_balances,
@@ -853,6 +861,14 @@ async def _handle_create_items(
                     split_value=sval,
                 )
             )
+        await record_expense_activity(
+            session=session,
+            expense=exp,
+            actor_id=user.id,
+            event_type=EVENT_EXPENSE_CREATED,
+            split_user_ids=[uid for uid, _, _, _ in splits],
+            metadata={"source": "voice"},
+        )
         created_shared_ids.append(exp.id)
 
     await session.commit()
@@ -989,6 +1005,14 @@ async def _handle_settle(
         is_deleted=False,
     )
     session.add(settlement)
+    await session.flush()
+    await record_settlement_activity(
+        session=session,
+        settlement=settlement,
+        actor_id=user.id,
+        event_type=EVENT_SETTLEMENT_CREATED,
+        metadata={"source": "voice"},
+    )
     await session.commit()
     await session.refresh(settlement)
 
@@ -1071,6 +1095,11 @@ async def _apply_update_or_delete(
             return None
 
     if action_type == "UPDATE":
+        prev_description = target_exp.description
+        prev_amount = target_exp.amount
+        prev_category = target_exp.category
+        prev_date = target_exp.expense_date
+
         if new_description and new_description.strip():
             cand_desc = new_description.strip()
             cur_desc = target_exp.description.strip()
@@ -1089,7 +1118,31 @@ async def _apply_update_or_delete(
         if new_expense_date is not None:
             target_exp.expense_date = new_expense_date
 
+        update_meta: dict[str, Any] = {"source": "voice"}
+        if target_exp.description != prev_description:
+            update_meta["previous_description"] = prev_description
+        if target_exp.amount != prev_amount:
+            update_meta["previous_amount"] = str(prev_amount)
+        if target_exp.category != prev_category:
+            update_meta["previous_category"] = prev_category
+
+        changed = (
+            target_exp.description != prev_description
+            or target_exp.amount != prev_amount
+            or target_exp.category != prev_category
+            or target_exp.expense_date != prev_date
+        )
+
         target_exp.updated_at = datetime.now(UTC)
+        if changed and not target_exp.is_personal:
+            await record_expense_activity(
+                session=session,
+                expense=target_exp,
+                actor_id=user.id,
+                event_type=EVENT_EXPENSE_UPDATED,
+                split_user_ids=[s.user_id for s in target_exp.splits],
+                metadata=update_meta,
+            )
         await session.commit()
 
         target_exp = (
@@ -1131,6 +1184,14 @@ async def _apply_update_or_delete(
     if action_type == "DELETE":
         target_exp.is_deleted = True
         target_exp.updated_at = datetime.now(UTC)
+        await record_expense_activity(
+            session=session,
+            expense=target_exp,
+            actor_id=user.id,
+            event_type=EVENT_EXPENSE_DELETED,
+            split_user_ids=[s.user_id for s in target_exp.splits],
+            metadata={"source": "voice"},
+        )
         await session.commit()
         return VoiceIngestResponse(
             status="SUCCESS",
